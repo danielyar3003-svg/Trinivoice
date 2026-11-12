@@ -19,7 +19,7 @@ local function deepcopy(t)
   return r
 end
 
-local function newClient(id, nick, x, y)
+local function newClient(id, nick, x, y, iniData)
   local ped = 1000 + id
   world.players[id] = { nick = nick, x = x, y = y, z = 10, ped = ped, car = nil }
   local me = world.players[id]
@@ -55,7 +55,8 @@ local function newClient(id, nick, x, y)
     cdef = function(s) pcall(ffi.cdef, s) end,
     load = function(name) if name == 'bass' then return bass end error('no ' .. name) end,
   }, { __index = ffi })
-  local inicfgStub = { load = function(def) return deepcopy(def) end, save = function() return true end }
+  -- iniData: содержимое trinivoice.ini, как его прочитал бы inicfg (без подмешивания значений по умолчанию)
+  local inicfgStub = { load = function(def) return iniData and deepcopy(iniData) or deepcopy(def) end, save = function() return true end }
   local vkeysStub = { id_to_name = function(k) return ({ [0x58] = 'X', [0x42] = 'B', [0x5A] = 'Z' })[k] or tostring(k) end }
   local sampevStub = {}
 
@@ -169,10 +170,12 @@ end
 
 local a = newClient(1, 'Ivan_Petrov', 0, 0)
 local b = newClient(2, 'Anna_Smirnova', 5, 0)
-local c = newClient(3, 'Sergey_Orlov', 2000, 0)
+-- C получил архив от админа: в ini вписан только адрес ретранслятора
+local c = newClient(3, 'Sergey_Orlov', 2000, 0, { main = { host = '127.0.0.1', port = PORT } })
 clients = { a, b, c }
 run(1)
-for _, cl in ipairs(clients) do cl.cmd('server 127.0.0.1 ' .. PORT) end
+a.cmd('server 127.0.0.1 ' .. PORT)
+b.cmd('server 127.0.0.1 ' .. PORT)
 
 local X, Z = 0x58, 0x5A
 local function hold(cl, key, steps) cl.st.keys[key] = true; run(steps); cl.st.keys[key] = nil; run(15) end

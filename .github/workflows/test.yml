@@ -3,14 +3,19 @@ on: [push, pull_request]
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [18, 22]   # 18 — версия из репозитория Ubuntu 24.04 (Oracle)
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ matrix.node }}
       - run: sudo apt-get update && sudo apt-get install -y luajit lua-socket
       - name: relay
-        run: cd server && npm test
+        run: cd server && node --test test/relay.test.js
+      - name: installer scripts
+        run: sudo apt-get install -y shellcheck && shellcheck server/deploy/*.sh
       - name: client modules
         run: luajit client/test/run.lua
       - name: menu on mimgui stub

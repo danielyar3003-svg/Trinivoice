@@ -54,7 +54,7 @@ local REPORT_SECONDS = 30
 local LOCAL_RATE = 16000     -- служебные звуки
 
 local INI = 'trinivoice.ini'
-local cfg = inicfg.load({
+local DEFAULTS = {
   main = {
     enabled = true,
     host = '127.0.0.1',
@@ -92,7 +92,26 @@ local cfg = inicfg.load({
   muted = {},
   volume = {},
   radio_presets = {},
-}, INI)
+}
+
+-- Ini может быть неполным (например, админ раздал архив только с адресом
+-- ретранслятора): всё, чего в нём нет, берём из DEFAULTS.
+local function loadConfig()
+  local function copy(t)
+    local r = {}
+    for k, v in pairs(t) do r[k] = type(v) == 'table' and copy(v) or v end
+    return r
+  end
+  local c = inicfg.load(copy(DEFAULTS), INI) or {}
+  for sec, keys in pairs(DEFAULTS) do
+    if type(c[sec]) ~= 'table' then c[sec] = {} end
+    for k, v in pairs(keys) do
+      if c[sec][k] == nil then c[sec][k] = v end
+    end
+  end
+  return c
+end
+local cfg = loadConfig()
 
 local function save() inicfg.save(cfg, INI) end
 local function msg(text) sampAddChatMessage('[TriniVoice] {FFFFFF}' .. cp(text), 0x5BD75B) end

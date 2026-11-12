@@ -16,11 +16,19 @@ luajit client/test/run.lua >/dev/null
 luajit client/test/ui_test.lua >/dev/null
 echo "ok"
 
-rm -rf dist && mkdir -p dist/client/moonloader dist/relay
+# UTF-8 с BOM и переводами строк Windows: Блокнот покажет русский текст правильно
+notepad() { printf '\xEF\xBB\xBF' > "$2"; sed 's/$/\r/' "$1" >> "$2"; }
+
+rm -rf dist && mkdir -p dist/client/moonloader dist/relay/client
+# для игроков: папка moonloader + простая инструкция
 cp -r client/moonloader/trinivoice.lua client/moonloader/lib client/moonloader/resource dist/client/moonloader/
-cp УСТАНОВКА.md dist/client/УСТАНОВКА.md
+notepad client/ПРОЧИТАЙ_МЕНЯ.txt dist/client/ПРОЧИТАЙ_МЕНЯ.txt
+# для админа: ретранслятор + установщик + файлы игроков (из них установщик соберёт
+# архив с адресом сервера)
 cp -r server/src server/deploy server/package.json server/config.example.json server/Dockerfile dist/relay/
-cp УСТАНОВКА.md dist/relay/УСТАНОВКА.md
+cp -r dist/client/moonloader dist/client/ПРОЧИТАЙ_МЕНЯ.txt dist/relay/client/
+notepad ИНСТРУКЦИЯ_АДМИНУ.txt dist/relay/ИНСТРУКЦИЯ_АДМИНУ.txt
+cp УСТАНОВКА.md dist/relay/
 (cd dist/client && zip -qr "../TriniVoice-$VERSION-client.zip" .)
 (cd dist/relay && zip -qr "../TriniVoice-$VERSION-relay.zip" .)
 rm -rf dist/client dist/relay
