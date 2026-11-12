@@ -1,0 +1,11 @@
+{
+  "host": "0.0.0.0",
+  "port": 7790,
+  "allowedRooms": [],
+  "bannedNicks": [],
+  "clientTimeoutMs": 10000,
+  "maxVoicePacketsPerSec": 60,
+  "maxPayloadBytes": 512,
+  "rangeMargin": 1.25,
+  "rangeSlack": 5
+}
