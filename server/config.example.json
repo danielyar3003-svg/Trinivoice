@@ -10,8 +10,11 @@
   "admins": [
     { "name": "Admin", "key": "замените-на-длинный-случайный-ключ" }
   ],
-  "latestClientVersion": "0.3.0",
-  "minClientVersion": "0.3.0",
+  "latestClientVersion": "0.4.0",
+  "minClientVersion": "0.4.0",
+  "adminIps": [],
+  "maxClients": 2000,
+  "maxClientsPerIp": 4,
   "clientTimeoutMs": 10000,
   "callRingTimeoutMs": 30000,
   "reportCooldownMs": 30000,

@@ -1,16 +1,21 @@
--- TriniVoice: протокол v2 (см. docs/PROTOCOL.md). Чистый Lua + ffi, без игры.
+-- TriniVoice: протокол v3 (см. docs/PROTOCOL.md). Чистый Lua + ffi, без игры.
 local ffi = require 'ffi'
 local bit = require 'bit'
 
 local P = {}
 
-P.VERSION = 2
+P.VERSION = 3
 local HDR = 'TV' .. string.char(P.VERSION)
+-- Токен сессии (8 байт) идёт в каждом пакете клиента. Его выдаёт ретранслятор
+-- (S_TOKEN) в ответ на первый STATE; до этого шлём нули.
+P.TOKEN_LEN = 8
+P.token = string.rep('\0', P.TOKEN_LEN)
+function P.setToken(t) if #t == P.TOKEN_LEN then P.token = t end end
 
 P.C_STATE, P.C_VOICE, P.C_BYE, P.C_CALL, P.C_REPORT, P.C_ADMIN = 0x01, 0x02, 0x03, 0x04, 0x05, 0x06
-P.S_ACK, P.S_VOICE, P.S_CALL, P.S_NOTICE = 0x81, 0x82, 0x83, 0x84
+P.S_ACK, P.S_VOICE, P.S_CALL, P.S_NOTICE, P.S_TOKEN = 0x81, 0x82, 0x83, 0x84, 0x85
 
-P.ACK_OK, P.ACK_ROOM, P.ACK_ID_TAKEN, P.ACK_BANNED, P.ACK_MUTED, P.ACK_OUTDATED = 0, 1, 2, 3, 4, 5
+P.ACK_OK, P.ACK_ROOM, P.ACK_ID_TAKEN, P.ACK_BANNED, P.ACK_MUTED, P.ACK_OUTDATED, P.ACK_FULL = 0, 1, 2, 3, 4, 5, 6
 
 P.MODE_WHISPER, P.MODE_NORMAL, P.MODE_SHOUT, P.MODE_MEGAPHONE, P.MODE_RADIO, P.MODE_PHONE = 1, 2, 3, 4, 5, 6
 P.MODE_RANGE = { 3, 15, 40, 60, 8, 5 }
@@ -42,16 +47,18 @@ local function str(s)
   return string.char(#s) .. s
 end
 
+local function head(t) return HDR .. u8(t) .. P.token end
+
 function P.packState(t)
-  return HDR .. u8(P.C_STATE) .. u16(t.id) .. f32(t.x) .. f32(t.y) .. f32(t.z) .. u8(t.interior or 0) ..
+  return head(P.C_STATE) .. u16(t.id) .. f32(t.x) .. f32(t.y) .. f32(t.z) .. u8(t.interior or 0) ..
     str(t.room) .. str(t.nick) .. str(t.version) .. u16(t.radioFreq or 0) .. str(t.radioPass)
 end
-function P.packVoice(seq, mode, codec, payload) return HDR .. u8(P.C_VOICE) .. u16(seq) .. u8(mode) .. u8(codec) .. payload end
-function P.packBye() return HDR .. u8(P.C_BYE) end
-function P.packCall(action, target) return HDR .. u8(P.C_CALL) .. u8(action) .. u16(target or 0) end
-function P.packReport(target, reason) return HDR .. u8(P.C_REPORT) .. u16(target) .. str(reason) end
+function P.packVoice(seq, mode, codec, payload) return head(P.C_VOICE) .. u16(seq) .. u8(mode) .. u8(codec) .. payload end
+function P.packBye() return head(P.C_BYE) end
+function P.packCall(action, target) return head(P.C_CALL) .. u8(action) .. u16(target or 0) end
+function P.packReport(target, reason) return head(P.C_REPORT) .. u16(target) .. str(reason) end
 function P.packAdmin(key, action, nick, minutes)
-  return HDR .. u8(P.C_ADMIN) .. str(key) .. u8(action) .. str(nick) .. u32(minutes or 0)
+  return head(P.C_ADMIN) .. str(key) .. u8(action) .. str(nick) .. u32(minutes or 0)
 end
 
 -- чтение
@@ -87,6 +94,9 @@ function P.parseServer(s)
     p = { type = t, event = r:u8(), peerId = r:u16(), peerNick = r:str() }
   elseif t == P.S_NOTICE then
     p = { type = t, code = r:u8(), text = r:str() }
+  elseif t == P.S_TOKEN then
+    if not r:need(P.TOKEN_LEN) then return nil end
+    p = { type = t, token = s:sub(r.pos, r.pos + P.TOKEN_LEN - 1) }
   else
     return nil
   end
@@ -100,6 +110,25 @@ function P.freqToWire(f)
   return math.floor(f * 10 + 0.5)
 end
 function P.freqLabel(w) return ('%.1f'):format((w or 0) / 10) end
+
+-- Текст от ретранслятора в чат: без цветовых кодов SA-MP {RRGGBB}, управляющих
+-- символов и не длиннее limit байт — ретранслятор не может подделать сообщения в чате.
+function P.cleanText(s, limit)
+  s = tostring(s or ''):gsub('{%x%x%x%x%x%x}', ''):gsub('[{}]', ''):gsub('[%z\1-\31\127]', '')
+  limit = limit or 160
+  if #s > limit then
+    s = s:sub(1, limit)
+    -- не резать UTF-8 символ посередине
+    while #s > 0 and s:byte(#s) >= 0x80 and s:byte(#s) < 0xC0 do s = s:sub(1, -2) end
+    if #s > 0 and s:byte(#s) >= 0xC0 then s = s:sub(1, -2) end
+  end
+  return s
+end
+
+-- Ник SA-MP: только разрешённые сервером символы (и безопасно для имени файла).
+function P.cleanNick(s)
+  return (tostring(s or ''):gsub('[^%w%[%]%(%)%$@%._=]', '')):sub(1, 24)
+end
 
 function P.compareVersions(a, b)
   local pa, pb = {}, {}

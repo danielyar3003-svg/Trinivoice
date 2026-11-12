@@ -1,0 +1,43 @@
+[Unit]
+Description=TriniVoice relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=trinivoice
+Group=trinivoice
+WorkingDirectory=/opt/trinivoice/app
+Environment=NODE_ENV=production
+Environment=DATA_DIR=/var/lib/trinivoice
+ExecStart=/usr/bin/node /opt/trinivoice/app/src/index.js /etc/trinivoice/config.json
+Restart=on-failure
+RestartSec=3
+
+# Песочница: процесс видит систему только для чтения, пишет лишь в свою папку данных,
+# не может получить новые права, загрузить модули ядра или открыть что-то кроме сети IPv4/IPv6.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=/var/lib/trinivoice
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+UMask=0077
+MemoryMax=512M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

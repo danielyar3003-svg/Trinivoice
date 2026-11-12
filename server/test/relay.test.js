@@ -17,6 +17,14 @@ function setup(config = {}) {
     send: (buf, address, port) => sent.push({ to: `${address}:${port}`, pkt: P.decodeServer(buf) }),
     onReport: (r) => reports.push(r),
   });
+  // Тесты ниже собирают пакеты без токена: подставляем правильный токен адреса,
+  // как сделал бы честный клиент. Проверки самих токенов — через relay.raw().
+  relay.raw = relay.handle.bind(relay);
+  relay.handle = (buf, address, port) => {
+    const b = Buffer.from(buf);
+    if (b.length >= 12) relay.tokenFor(address, port).copy(b, 4);
+    relay.raw(b, address, port);
+  };
   return { relay, sent, reports, tick: (ms) => { t += ms; }, clear: () => { sent.length = 0; } };
 }
 const ROOM = '1.2.3.4:7777';
@@ -28,8 +36,10 @@ const of = (sent, type) => sent.filter((s) => s.pkt?.type === type);
 const voiceTo = (sent) => of(sent, P.S_VOICE).map((s) => `${s.to}/${s.pkt.route}`).sort();
 
 test('protocol round trip', () => {
-  const s = P.decodeClient(P.encodeState({ playerId: 7, x: 1.5, y: -2, z: 3, interior: 4, room: ROOM, nick: 'A_B', version: '0.3.1', radioFreq: 9115, radioPass: 'пароль' }));
-  assert.deepEqual(s, { type: P.C_STATE, playerId: 7, x: 1.5, y: -2, z: 3, interior: 4, room: ROOM, nick: 'A_B', version: '0.3.1', radioFreq: 9115, radioPass: 'пароль' });
+  const token = Buffer.from('12345678');
+  const s = P.decodeClient(P.encodeState({ playerId: 7, x: 1.5, y: -2, z: 3, interior: 4, room: ROOM, nick: 'A_B', version: '0.3.1', radioFreq: 9115, radioPass: 'пароль', token }));
+  assert.deepEqual({ ...s, token: s.token.toString() }, { type: P.C_STATE, playerId: 7, x: 1.5, y: -2, z: 3, interior: 4, room: ROOM, nick: 'A_B', version: '0.3.1', radioFreq: 9115, radioPass: 'пароль', token: '12345678' });
+  assert.equal(P.decodeClient(Buffer.from('TV\x03\x03abc')), null, 'packet shorter than a token');
   assert.equal(P.decodeClient(P.encodeClientVoice(1, 2, 1, Buffer.alloc(0))), null);
   assert.equal(P.decodeClient(Buffer.from('TV\x01\x01')), null, 'v1 packets rejected');
   const ack = P.decodeServer(P.encodeAck({ status: 4, online: 3, radioListeners: 2, mutedSec: 60, latestVersion: '0.4.0' }));
@@ -45,7 +55,7 @@ test('proximity voice goes only to nearby players, ack carries online count and 
   join(relay, 'b', 2, 10, 0);
   join(relay, 'c', 3, 200, 0);
   const ack = of(sent, P.S_ACK).at(-1).pkt;
-  assert.equal(ack.status, P.ACK_OK); assert.equal(ack.online, 3); assert.equal(ack.latestVersion, '0.3.0');
+  assert.equal(ack.status, P.ACK_OK); assert.equal(ack.online, 3); assert.equal(ack.latestVersion, '0.4.0');
   clear();
   speak(relay, 'a');
   assert.deepEqual(voiceTo(sent), ['b:1/0']);
@@ -195,7 +205,7 @@ test('reports are recorded with cooldown', () => {
 });
 
 test('outdated client, allowed rooms, static bans, id ownership', () => {
-  const { relay, sent } = setup({ minClientVersion: '0.3.0', allowedRooms: [ROOM], bannedNicks: ['bad_guy'] });
+  const { relay, sent } = setup({ minClientVersion: '0.4.0', allowedRooms: [ROOM], bannedNicks: ['bad_guy'] });
   join(relay, 'a', 1, 0, 0, { version: '0.2.0' });
   assert.equal(of(sent, P.S_ACK).at(-1).pkt.status, P.ACK_OUTDATED);
   join(relay, 'a', 1, 0, 0, { room: '9.9.9.9:1' });
@@ -231,4 +241,63 @@ test('moderation persists to file', () => {
   assert.ok(m2.isBanned('x', '5.5.5.5'));
   assert.ok(m2.isBanned('BAD_ONE', '1.1.1.1'));
   fs.rmSync(dir, { recursive: true });
+});
+
+test('session token: spoofed source gets nothing, real source gets a small token reply', () => {
+  const { relay, sent, clear } = setup();
+  join(relay, 'a', 1, 0, 0);
+  clear();
+  // злоумышленник подделывает адрес жертвы 'victim' и шлёт STATE без токена
+  relay.raw(P.encodeState({ playerId: 9, x: 0, y: 0, z: 0, room: ROOM, nick: 'Fake' }), 'victim', 5);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].to, 'victim:5');
+  assert.equal(sent[0].pkt.type, P.S_TOKEN);
+  const reply = P.encodeToken(relay.tokenFor('victim', 5));
+  assert.ok(reply.length < P.encodeState({ playerId: 9, x: 0, y: 0, z: 0, room: 'r', nick: 'n' }).length, 'no amplification');
+  assert.equal(relay.clients.size, 1, 'spoofed address is not registered');
+  // голос/звонок/жалоба/админ с неверным токеном молча отбрасываются
+  clear();
+  relay.raw(P.encodeClientVoice(1, 2, 1, Buffer.alloc(160), Buffer.alloc(8)), 'a', 1);
+  relay.raw(P.encodeAdmin('whatever-key', P.ADMIN_BAN, 'Nick_1', 0, Buffer.alloc(8)), 'x', 1);
+  assert.equal(sent.length, 0);
+  // чужой токен не подходит к другому адресу
+  relay.raw(P.encodeClientVoice(1, 2, 1, Buffer.alloc(160), relay.tokenFor('a', 1)), 'a', 2);
+  assert.equal(sent.length, 0);
+  // с правильным токеном клиент регистрируется
+  relay.raw(P.encodeState({ playerId: 9, x: 0, y: 0, z: 0, room: ROOM, nick: 'Real', token: relay.tokenFor('victim', 5) }), 'victim', 5);
+  assert.equal(of(sent, P.S_ACK).at(-1).pkt.status, P.ACK_OK);
+});
+
+test('session limits per IP and in total', () => {
+  const { relay, sent } = setup({ maxClientsPerIp: 2, maxClients: 3 });
+  join(relay, 'ip1', 1, 0, 0);
+  relay.handle(P.encodeState({ playerId: 2, x: 0, y: 0, z: 0, room: ROOM, nick: 'B' }), 'ip1', 2);
+  relay.handle(P.encodeState({ playerId: 3, x: 0, y: 0, z: 0, room: ROOM, nick: 'C' }), 'ip1', 3);
+  assert.equal(of(sent, P.S_ACK).at(-1).pkt.status, P.ACK_FULL, 'third session from one IP');
+  join(relay, 'ip2', 4, 0, 0);
+  join(relay, 'ip3', 5, 0, 0);
+  assert.equal(of(sent, P.S_ACK).at(-1).pkt.status, P.ACK_FULL, 'relay is full');
+  relay.handle(P.encodeBye(), 'ip1', 1);
+  relay.handle(P.encodeState({ playerId: 3, x: 0, y: 0, z: 0, room: ROOM, nick: 'C' }), 'ip1', 3);
+  assert.equal(of(sent, P.S_ACK).at(-1).pkt.status, P.ACK_OK, 'slot freed after bye');
+});
+
+test('admin key brute force is locked out; admin IP allowlist', () => {
+  const { relay, sent, clear, tick } = setup({ admins: [{ name: 'Boss', key: 'super-secret-key' }], adminMaxFailures: 3, adminLockMs: 60000 });
+  join(relay, 'b', 2, 0, 0);
+  for (let i = 0; i < 3; i++) relay.handle(P.encodeAdmin('guess-' + i + '-xxxx', P.ADMIN_MUTE, 'Nick_2', 1), 'evil', 1);
+  clear();
+  relay.handle(P.encodeAdmin('super-secret-key', P.ADMIN_MUTE, 'Nick_2', 1), 'evil', 1);
+  assert.equal(sent.length, 0, 'locked out even with the right key');
+  assert.equal(relay.mod.mutedFor('Nick_2'), 0);
+  tick(61000);
+  relay.sweep();
+  relay.handle(P.encodeAdmin('super-secret-key', P.ADMIN_MUTE, 'Nick_2', 1), 'evil', 1);
+  assert.equal(of(sent, P.S_NOTICE).at(-1).pkt.code, P.NOTICE_ADMIN_OK, 'lock expires');
+
+  const r2 = setup({ admins: [{ name: 'Boss', key: 'super-secret-key' }], adminIps: ['10.0.0.1'] });
+  r2.relay.handle(P.encodeAdmin('super-secret-key', P.ADMIN_KICK, 'X', 0), '6.6.6.6', 1);
+  assert.equal(of(r2.sent, P.S_NOTICE).at(-1).pkt.code, P.NOTICE_ADMIN_DENIED);
+  r2.relay.handle(P.encodeAdmin('super-secret-key', P.ADMIN_KICK, 'X', 0), '10.0.0.1', 1);
+  assert.equal(of(r2.sent, P.S_NOTICE).at(-1).pkt.code, P.NOTICE_ADMIN_OK);
 });

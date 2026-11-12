@@ -1,7 +1,11 @@
-// TriniVoice wire protocol v2 (little endian). See docs/PROTOCOL.md.
+// TriniVoice wire protocol v3 (little endian). See docs/PROTOCOL.md.
 export const MAGIC0 = 0x54; // 'T'
 export const MAGIC1 = 0x56; // 'V'
-export const VERSION = 2;
+export const VERSION = 3;
+// Every client packet carries an 8-byte session token right after the header.
+// The relay hands it out (S_TOKEN) only to the real source address, so a spoofed
+// source IP can never register or speak.
+export const TOKEN_LEN = 8;
 
 // client -> relay
 export const C_STATE = 0x01;
@@ -15,6 +19,7 @@ export const S_ACK = 0x81;
 export const S_VOICE = 0x82;
 export const S_CALL = 0x83;
 export const S_NOTICE = 0x84;
+export const S_TOKEN = 0x85;
 
 export const ACK_OK = 0;
 export const ACK_ROOM_NOT_ALLOWED = 1;
@@ -22,6 +27,7 @@ export const ACK_ID_TAKEN = 2;
 export const ACK_BANNED = 3;
 export const ACK_MUTED = 4;
 export const ACK_OUTDATED = 5;
+export const ACK_FULL = 6; // too many sessions from this IP or on the relay
 
 export const MODE_WHISPER = 1;
 export const MODE_NORMAL = 2;
@@ -81,8 +87,11 @@ class Reader {
   }
 }
 
+const NO_TOKEN = Buffer.alloc(TOKEN_LEN);
+
 class Writer {
   constructor(type) { this.parts = [Buffer.from([MAGIC0, MAGIC1, VERSION, type])]; }
+  token(t) { this.parts.push(t ?? NO_TOKEN); return this; }
   u8(v) { this.parts.push(Buffer.from([v & 0xff])); return this; }
   u16(v) { const b = Buffer.alloc(2); b.writeUInt16LE(Math.max(0, Math.min(v, 0xffff))); this.parts.push(b); return this; }
   u32(v) { const b = Buffer.alloc(4); b.writeUInt32LE(Math.max(0, Math.min(v, 0xffffffff)) >>> 0); this.parts.push(b); return this; }
@@ -101,7 +110,9 @@ class Writer {
 export function decodeClient(buf) {
   if (buf.length < HEADER || buf[0] !== MAGIC0 || buf[1] !== MAGIC1 || buf[2] !== VERSION) return null;
   const type = buf[3];
-  const r = new Reader(buf, HEADER);
+  if (buf.length < HEADER + TOKEN_LEN) return null;
+  const token = buf.subarray(HEADER, HEADER + TOKEN_LEN);
+  const r = new Reader(buf, HEADER + TOKEN_LEN);
   let p;
   switch (type) {
     case C_STATE: {
@@ -116,15 +127,18 @@ export function decodeClient(buf) {
       p = { type, seq: r.u16(), mode: r.u8(), codec: r.u8() };
       if (!r.ok || r.off >= buf.length) return null; // payload must not be empty
       p.payload = buf.subarray(r.off);
+      p.token = token;
       return p;
     }
-    case C_BYE: return { type };
+    case C_BYE: return { type, token };
     case C_CALL: p = { type, action: r.u8(), target: r.u16() }; break;
     case C_REPORT: p = { type, target: r.u16(), reason: r.str('utf8') }; break;
     case C_ADMIN: p = { type, key: r.str('utf8'), action: r.u8(), nick: r.str(), minutes: r.u32() }; break;
     default: return null;
   }
-  return r.ok ? p : null;
+  if (!r.ok) return null;
+  p.token = token;
+  return p;
 }
 
 export function encodeAck({ status, online = 0, radioListeners = 0, mutedSec = 0, latestVersion = '' }) {
@@ -139,24 +153,28 @@ export function encodeCall(event, peerId, peerNick) {
   return new Writer(S_CALL).u8(event).u16(peerId).str(peerNick).done();
 }
 
+export function encodeToken(token) {
+  return new Writer(S_TOKEN).bytes(token).done();
+}
+
 export function encodeNotice(code, text) {
   return new Writer(S_NOTICE).u8(code).str(text, 'utf8').done();
 }
 
 // Client-side packet builders (tests and tools).
-export function encodeState({ playerId, x, y, z, interior = 0, room, nick, version = '0.3.0', radioFreq = 0, radioPass = '' }) {
-  return new Writer(C_STATE).u16(playerId).f32(x).f32(y).f32(z).u8(interior)
+export function encodeState({ playerId, x, y, z, interior = 0, room, nick, version = '0.4.0', radioFreq = 0, radioPass = '', token }) {
+  return new Writer(C_STATE).token(token).u16(playerId).f32(x).f32(y).f32(z).u8(interior)
     .str(room).str(nick).str(version).u16(radioFreq).str(radioPass, 'utf8').done();
 }
-export function encodeClientVoice(seq, mode, codec, payload) {
-  return new Writer(C_VOICE).u16(seq).u8(mode).u8(codec).bytes(payload).done();
+export function encodeClientVoice(seq, mode, codec, payload, token) {
+  return new Writer(C_VOICE).token(token).u16(seq).u8(mode).u8(codec).bytes(payload).done();
 }
-export function encodeClientCall(action, target) { return new Writer(C_CALL).u8(action).u16(target).done(); }
-export function encodeReport(target, reason) { return new Writer(C_REPORT).u16(target).str(reason, 'utf8').done(); }
-export function encodeAdmin(key, action, nick, minutes = 0) {
-  return new Writer(C_ADMIN).str(key, 'utf8').u8(action).str(nick).u32(minutes).done();
+export function encodeClientCall(action, target, token) { return new Writer(C_CALL).token(token).u8(action).u16(target).done(); }
+export function encodeReport(target, reason, token) { return new Writer(C_REPORT).token(token).u16(target).str(reason, 'utf8').done(); }
+export function encodeAdmin(key, action, nick, minutes = 0, token) {
+  return new Writer(C_ADMIN).token(token).str(key, 'utf8').u8(action).str(nick).u32(minutes).done();
 }
-export function encodeBye() { return new Writer(C_BYE).done(); }
+export function encodeBye(token) { return new Writer(C_BYE).token(token).done(); }
 
 export function decodeServer(buf) {
   if (buf.length < HEADER || buf[0] !== MAGIC0 || buf[1] !== MAGIC1 || buf[2] !== VERSION) return null;
@@ -169,6 +187,7 @@ export function decodeServer(buf) {
     p.payload = buf.subarray(r.off);
   } else if (type === S_CALL) p = { type, event: r.u8(), peerId: r.u16(), peerNick: r.str() };
   else if (type === S_NOTICE) p = { type, code: r.u8(), text: r.str('utf8') };
+  else if (type === S_TOKEN) { if (!r.need(TOKEN_LEN)) return null; p = { type, token: buf.subarray(r.off, r.off + TOKEN_LEN) }; }
   else return null;
   return r.ok ? p : null;
 }

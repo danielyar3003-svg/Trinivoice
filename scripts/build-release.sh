@@ -19,7 +19,7 @@ echo "ok"
 rm -rf dist && mkdir -p dist/client/moonloader dist/relay
 cp -r client/moonloader/trinivoice.lua client/moonloader/lib client/moonloader/resource dist/client/moonloader/
 cp УСТАНОВКА.md dist/client/УСТАНОВКА.md
-cp -r server/src server/package.json server/config.example.json server/Dockerfile dist/relay/
+cp -r server/src server/deploy server/package.json server/config.example.json server/Dockerfile dist/relay/
 cp УСТАНОВКА.md dist/relay/УСТАНОВКА.md
 (cd dist/client && zip -qr "../TriniVoice-$VERSION-client.zip" .)
 (cd dist/relay && zip -qr "../TriniVoice-$VERSION-relay.zip" .)

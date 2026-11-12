@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import * as P from './protocol.js';
 import { Moderation } from './moderation.js';
 
@@ -15,8 +16,15 @@ export const DEFAULT_CONFIG = {
   reportCooldownMs: 30000,
   // администраторы ретранслятора: [{ "name": "Admin", "key": "длинный-секрет" }]
   admins: [],
-  latestClientVersion: '0.3.0',
-  minClientVersion: '0.3.0',
+  latestClientVersion: '0.4.0',
+  minClientVersion: '0.4.0',
+  // защита от перегрузки
+  maxClients: 2000,
+  maxClientsPerIp: 4,
+  // админ-команды: только с этих IP (пусто = с любого) и блокировка подбора ключа
+  adminIps: [],
+  adminMaxFailures: 5,
+  adminLockMs: 15 * 60000,
 };
 
 /**
@@ -39,13 +47,31 @@ export class Relay {
     this.allowed = new Set(this.config.allowedRooms);
     this.radioPasswords = new Map(Object.entries(this.config.radioPasswords).map(([f, pw]) => [Math.round(parseFloat(f) * 10), String(pw)]));
     this.adminKeys = new Map(this.config.admins.filter((a) => a.key && a.key.length >= 8).map((a) => [a.key, a.name ?? 'admin']));
+    this.adminIps = new Set(this.config.adminIps);
+    this.adminFailures = new Map(); // ip -> { count, since, lockedUntil }
+    this.perIp = new Map();         // ip -> number of sessions
+    // Секрет для токенов сессий. Новый при каждом запуске: после перезапуска
+    // клиенты просто получают новый токен в ответ на следующий STATE.
+    this.secret = config.tokenSecret ?? crypto.randomBytes(32);
     this.stats = { in: 0, out: 0, dropped: 0 };
+  }
+
+  tokenFor(address, port) {
+    return crypto.createHmac('sha256', this.secret).update(`${address}:${port}`).digest().subarray(0, P.TOKEN_LEN);
   }
 
   handle(buf, address, port) {
     this.stats.in++;
     const pkt = P.decodeClient(buf);
     if (!pkt) { this.stats.dropped++; return; }
+    const expected = this.tokenFor(address, port);
+    if (!crypto.timingSafeEqual(pkt.token, expected)) {
+      // Токен уходит только на адрес отправителя, и ответ (12 байт) меньше STATE,
+      // поэтому подделка IP не даёт ни сессии, ни усиления трафика.
+      if (pkt.type === P.C_STATE) this.#out(P.encodeToken(expected), address, port);
+      this.stats.dropped++;
+      return;
+    }
     const key = `${address}:${port}`;
     if (pkt.type === P.C_STATE) return this.#onState(key, address, port, pkt);
     const client = this.clients.get(key);
@@ -91,8 +117,12 @@ export class Relay {
     if (holder && holder !== client) return this.#ack(address, port, P.ACK_ID_TAKEN, { online: this.rooms.get(p.room).size });
     if (client && (client.room !== p.room || client.playerId !== p.playerId)) this.#detach(client);
     if (!client) {
+      if (this.clients.size >= this.config.maxClients || (this.perIp.get(address) ?? 0) >= this.config.maxClientsPerIp) {
+        return this.#ack(address, port, P.ACK_FULL);
+      }
       client = { key, address, port, bucket: this.config.maxVoicePacketsPerSec, bucketAt: t, call: null, reportAt: -Infinity };
       this.clients.set(key, client);
+      this.perIp.set(address, (this.perIp.get(address) ?? 0) + 1);
       this.log(`join ${p.nick}[${p.playerId}] ${address} room=${p.room} v${p.version}`);
     }
     Object.assign(client, {
@@ -235,12 +265,27 @@ export class Relay {
   }
 
   #onAdmin(client, address, port, p) {
-    const admin = this.adminKeys.get(p.key);
     const reply = (code, text) => this.#out(P.encodeNotice(code, text), address, port);
+    if (this.adminIps.size && !this.adminIps.has(address)) {
+      this.log(`admin: command from non-admin IP ${address} ignored`);
+      return reply(P.NOTICE_ADMIN_DENIED, 'Команды администратора с этого IP запрещены');
+    }
+    const t = this.now();
+    let fail = this.adminFailures.get(address);
+    if (fail && fail.lockedUntil > t) return; // подбор ключа: молча игнорируем
+    const admin = this.adminKeys.get(p.key);
     if (!admin) {
+      if (!fail || t - fail.since > this.config.adminLockMs) fail = { count: 0, since: t, lockedUntil: 0 };
+      fail.count++;
+      if (fail.count >= this.config.adminMaxFailures) {
+        fail.lockedUntil = t + this.config.adminLockMs;
+        this.log(`admin: ${address} locked out after ${fail.count} wrong keys`);
+      }
+      this.adminFailures.set(address, fail);
       this.log(`admin: wrong key from ${address}`);
       return reply(P.NOTICE_ADMIN_DENIED, 'Неверный ключ администратора');
     }
+    this.adminFailures.delete(address);
     const nick = p.nick.trim();
     if (!nick) return reply(P.NOTICE_ADMIN_DENIED, 'Не указан ник');
     const online = [...this.clients.values()].filter((c) => c.nick?.toLowerCase() === nick.toLowerCase());
@@ -285,12 +330,18 @@ export class Relay {
 
   #remove(client) {
     this.#detach(client);
-    this.clients.delete(client.key);
+    if (this.clients.delete(client.key)) {
+      const n = (this.perIp.get(client.address) ?? 1) - 1;
+      if (n > 0) this.perIp.set(client.address, n); else this.perIp.delete(client.address);
+    }
   }
 
   /** Drop silent clients and unanswered calls. Call periodically. */
   sweep() {
     const t = this.now();
+    for (const [ip, f] of this.adminFailures) {
+      if (f.lockedUntil < t && t - f.since > this.config.adminLockMs) this.adminFailures.delete(ip);
+    }
     const cutoff = t - this.config.clientTimeoutMs;
     for (const c of this.clients.values()) {
       if (c.seenAt < cutoff) { this.#remove(c); continue; }

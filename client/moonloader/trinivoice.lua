@@ -8,7 +8,7 @@
 --   audio.lua     кодеки, эффекты (рация, телефон, мегафон, стены), служебные звуки, WAV
 --   ui.lua        меню /tv на mimgui (необязательно)
 
-local SCRIPT_VERSION = '0.3.0'
+local SCRIPT_VERSION = '0.4.0'
 script_name('TriniVoice')
 script_author('TriniVoice')
 script_version(SCRIPT_VERSION)
@@ -40,6 +40,7 @@ local ACK_TEXT = {
   [P.ACK_ID_TAKEN] = 'ваш ID уже занят другим клиентом',
   [P.ACK_BANNED] = 'вам запрещён голосовой чат на этом ретрансляторе',
   [P.ACK_OUTDATED] = 'версия скрипта устарела: обновите TriniVoice',
+  [P.ACK_FULL] = 'ретранслятор переполнен или слишком много подключений с вашего IP',
 }
 -- служебный транспорт, в котором крик становится мегафоном
 local SERVICE_VEHICLES = {}
@@ -209,6 +210,7 @@ end
 
 local function openSocket()
   if udp then udp:close() end
+  P.setToken(string.rep('\0', P.TOKEN_LEN)) -- новый ретранслятор — новый токен
   udp = socket.udp()
   udp:settimeout(0)
   local ok, err = udp:setpeername(cfg.main.host, cfg.main.port)
@@ -543,6 +545,7 @@ local function hangup(quiet)
 end
 
 local function onCall(p, now)
+  p.peerNick = P.cleanNick(p.peerNick)
   local who = ('%s [%d]'):format(p.peerNick, p.peerId)
   if p.event == P.EV_INCOMING then
     call = { state = 'in', peerId = p.peerId, peerNick = p.peerNick, since = now }
@@ -615,7 +618,7 @@ local function report(id, reason)
   if r and r.filled > 0 then
     local dir = getWorkingDirectory() .. '\\config\\trinivoice\\reports'
     if not doesDirectoryExist(dir) then createDirectory(dir) end
-    local path = ('%s\\%s_%s.wav'):format(dir, os.date('%Y%m%d_%H%M%S'), nick)
+    local path = ('%s\\%s_%s.wav'):format(dir, os.date('%Y%m%d_%H%M%S'), P.cleanNick(nick))
     local f = io.open(path, 'wb')
     if f then
       f:write(r:wav()); f:close()
@@ -673,7 +676,11 @@ local function processNetwork(now)
       if p.type == P.S_ACK then onAck(p, now)
       elseif p.type == P.S_VOICE then if cfg.main.enabled then onVoice(p, now) end
       elseif p.type == P.S_CALL then onCall(p, now)
-      elseif p.type == P.S_NOTICE then msg(p.text) end
+      elseif p.type == P.S_NOTICE then msg(P.cleanText(p.text))
+      elseif p.type == P.S_TOKEN then
+        P.setToken(p.token)
+        net.lastState = 0 -- сразу повторить STATE уже с токеном
+      end
     end
   end
 

@@ -68,6 +68,10 @@ local function newClient(id, nick, x, y)
     elseif name == 'vkeys' then return vkeysStub
     elseif name == 'lib.samp.events' then return sampevStub
     elseif name == 'trinivoice.ui' then error('mimgui not installed')
+    elseif name == 'trinivoice.protocol' then
+      -- в MoonLoader у каждого скрипта свой Lua-state: свой модуль и свой токен
+      st.protocol = st.protocol or dofile(here .. '/../moonloader/lib/trinivoice/protocol.lua')
+      return st.protocol
     end
     return require(name)
   end

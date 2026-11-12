@@ -10,7 +10,7 @@ cat > "$CFG" <<JSON
   "maxVoicePacketsPerSec": 5000,
   "radioPasswords": { "911.0": "lspd" },
   "admins": [ { "name": "e2e", "key": "e2e-admin-key-123" } ],
-  "latestClientVersion": "9.9.9", "minClientVersion": "0.3.0" }
+  "latestClientVersion": "9.9.9", "minClientVersion": "0.4.0" }
 JSON
 node server/src/index.js "$CFG" > "$DATA/relay.log" 2>&1 &
 RELAY=$!
