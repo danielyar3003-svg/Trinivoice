@@ -2,14 +2,13 @@
 -- Модуль ничего не знает про звук и сеть: всё берёт из ctx, который передаёт
 -- trinivoice.lua (см. M.init). Строки здесь в UTF-8, как и требует mimgui.
 --
--- Нужно: mimgui. Желательно: fAwesome6 (иконки) и шрифты Montserrat в
--- moonloader/resource/trinivoice/. Без них меню работает со шрифтом по умолчанию
--- и без иконок.
+-- Нужно: mimgui. Шрифты лежат в moonloader/resource/trinivoice/: Montserrat и
+-- иконки Font Awesome 4.7 (fontawesome-webfont.ttf). Без них меню работает со
+-- шрифтом по умолчанию и без иконок.
 
 local imgui = require 'mimgui'
 local ffi = require 'ffi'
-local okFa, fa = pcall(require, 'fAwesome6')
-if not okFa then fa = nil end
+local bit = require 'bit'
 
 local M = {}
 
@@ -72,11 +71,25 @@ local MODE_LABEL = { 'шёпот', 'обычный', 'крик' }
 -- Вспомогательное
 ---------------------------------------------------------------------------
 
+-- Иконки Font Awesome 4.7: имя -> код символа в fontawesome-webfont.ttf.
+local FA_FILE = 'fontawesome-webfont.ttf'
+local FA_MIN, FA_MAX = 0xF000, 0xF2E0
+local FA = {
+  MICROPHONE = 0xF130, MICROPHONE_SLASH = 0xF131, HOUSE = 0xF015, USERS = 0xF0C0, SLIDERS = 0xF1DE,
+  WALKIE_TALKIE = 0xF2CE, SERVER = 0xF233, EAR_LISTEN = 0xF2A2, COMMENT = 0xF075, VOLUME_HIGH = 0xF028,
+  BULLHORN = 0xF0A1, KEYBOARD = 0xF11C, ARROWS_ROTATE = 0xF021, VOLUME_XMARK = 0xF026,
+  MAGNIFYING_GLASS = 0xF002, XMARK = 0xF00D, PHONE = 0xF095, FLAG = 0xF024,
+}
+local function utf8char(cp)
+  return string.char(0xE0 + bit.rshift(cp, 12), 0x80 + bit.band(bit.rshift(cp, 6), 0x3F), 0x80 + bit.band(cp, 0x3F))
+end
+local GLYPH = {}
+for name, cp in pairs(FA) do GLYPH[name] = utf8char(cp) end
+local iconsReady = false
+
 local function icon(name)
-  if not fa then return '' end
-  local ok, r = pcall(fa, name)
-  if ok and type(r) == 'string' then return r end
-  return ''
+  if not iconsReady then return '' end
+  return GLYPH[name] or ''
 end
 
 local function clamp(v, lo, hi) if v < lo then return lo elseif v > hi then return hi end return v end
@@ -843,20 +856,24 @@ local function loadFonts()
   local io = imgui.GetIO()
   io.IniFilename = nil
   local cyr = io.Fonts:GetGlyphRangesCyrillic()
-  if fa then iconRanges = imgui.new.ImWchar[3](fa.min_range, fa.max_range, 0) end
+  local dir = getWorkingDirectory() .. '\\resource\\trinivoice\\'
 
+  local faPath = dir .. FA_FILE
+  if doesFileExist(faPath) then
+    -- диапазон должен жить, пока атлас шрифтов не собран: держим его в upvalue
+    iconRanges = imgui.new.ImWchar[3](FA_MIN, FA_MAX, 0)
+  end
   local function mergeIcons(size)
-    if not fa then return end
+    if not iconRanges then return end
     local cfg = imgui.ImFontConfig()
     cfg.MergeMode = true
     cfg.PixelSnapH = true
-    io.Fonts:AddFontFromMemoryCompressedBase85TTF(fa.get_font_data_base85('solid'), size, cfg, iconRanges)
+    io.Fonts:AddFontFromFileTTF(faPath, size, cfg, iconRanges)
   end
 
   -- иконки в шрифт по умолчанию, который mimgui уже загрузил
   mergeIcons(14)
 
-  local dir = getWorkingDirectory() .. '\\resource\\trinivoice\\'
   local fallback = getFolderPath(0x14) .. '\\trebucbd.ttf'
   local function add(file, size, withIcons)
     local path = dir .. file
@@ -870,11 +887,12 @@ local function loadFonts()
   fonts.bold = add('Montserrat-SemiBold.ttf', 15, true)
   fonts.small = add('Montserrat-Medium.ttf', 12, false)
   fonts.title = add('Montserrat-Bold.ttf', 22, false)
-  if fa then
+  if iconRanges then
     -- крупные иконки для плиток и пустых состояний
     local cfg = imgui.ImFontConfig()
     cfg.PixelSnapH = true
-    fonts.icon = io.Fonts:AddFontFromMemoryCompressedBase85TTF(fa.get_font_data_base85('solid'), 20, cfg, iconRanges)
+    fonts.icon = io.Fonts:AddFontFromFileTTF(faPath, 20, cfg, iconRanges)
+    iconsReady = true
   end
   if fonts.regular then io.FontDefault = fonts.regular end
 end
@@ -935,7 +953,7 @@ end
 function M.close() show[0] = false end
 function M.toggle() if show[0] then M.close() else M.open() end end
 function M.isOpen() return show[0] end
-function M.hasIcons() return fa ~= nil end
+function M.hasIcons() return iconsReady end
 -- true, пока игрок печатает в поле меню: клавиша разговора не должна срабатывать
 function M.wantsText() return show[0] and imgui.GetIO().WantTextInput end
 

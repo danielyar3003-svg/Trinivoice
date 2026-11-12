@@ -45,7 +45,13 @@ end
 local fontsAtlas = {}
 function fontsAtlas:GetGlyphRangesCyrillic() return ffi.new('uint16_t[3]', 0x20, 0x4FF, 0) end
 function fontsAtlas:AddFontFromFileTTF(path, size, cfg, ranges)
-  check(type(path) == 'string' and type(size) == 'number', 'AddFontFromFileTTF args'); return { path = path, size = size }
+  check(type(path) == 'string' and type(size) == 'number', 'AddFontFromFileTTF args')
+  if path:find('fontawesome-webfont.ttf', 1, true) then
+    -- иконки: диапазон Font Awesome 4.7, и он должен жить до сборки атласа
+    check(ranges ~= nil and ranges[0] == 0xF000 and ranges[1] >= 0xF2CE and ranges[2] == 0, 'icon glyph range')
+    iconFontLoaded = iconFontLoaded + 1
+  end
+  return { path = path, size = size }
 end
 function fontsAtlas:AddFontFromMemoryCompressedBase85TTF(data, size, cfg, ranges)
   check(type(data) == 'string' and type(size) == 'number' and ranges ~= nil, 'AddFontFromMemoryCompressedBase85TTF args')
@@ -138,18 +144,18 @@ getScreenResolution = function() return 1920, 1080 end
 isPauseMenuActive = function() return false end
 getWorkingDirectory = function() return 'C:\\game\\moonloader' end
 getFolderPath = function() return 'C:\\Windows\\Fonts' end
-local fileExists = true
-doesFileExist = function() return fileExists end
-
-local faMock = setmetatable({ min_range = 0xE000, max_range = 0xF8FF,
-  get_font_data_base85 = function(style) assert(style == 'solid'); return 'xx' end },
-  { __call = function(_, name) assert(type(name) == 'string'); return '\238\128\128' end })
+local fileExists, iconFileExists = true, true
+iconFontLoaded = 0
+doesFileExist = function(path)
+  if path:find('fontawesome-webfont.ttf', 1, true) then return iconFileExists end
+  return fileExists
+end
 
 local function loadUi(withFa)
   package.loaded['trinivoice.ui'] = nil
   package.loaded['mimgui'] = imguiMock
-  package.loaded['fAwesome6'] = withFa and faMock or nil
-  package.preload['fAwesome6'] = (not withFa) and function() error('module not found') end or nil
+  iconFileExists = withFa
+  iconFontLoaded = 0
   initCb, frameCb = {}, {}
   return dofile(here .. '/../moonloader/lib/trinivoice/ui.lua')
 end
@@ -239,6 +245,8 @@ for _, withFa in ipairs({ true, false }) do
       assert(#initCb == 1 and #frameCb == 1)
       initCb[1]()
       assert(ui.hasIcons() == withFa)
+      -- иконки: в шрифт по умолчанию и крупный всегда, в обычный и жирный — если они загрузились
+      assert(iconFontLoaded == (withFa and (haveFonts and 4 or 2) or 0), 'icon font loads: ' .. iconFontLoaded)
       -- страницы переключаются кликами по боковому меню; прогоняем много кадров
       -- со случайными наведениями и кликами
       runFrames(ui, ctx, 400)

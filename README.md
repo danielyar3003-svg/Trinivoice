@@ -46,15 +46,16 @@
 
 ## Установка клиента
 
+Подробная инструкция для игроков и владельца ретранслятора: [УСТАНОВКА.md](УСТАНОВКА.md).
+
 Скачайте `TriniVoice-<версия>-client.zip` (собирается `scripts/build-release.sh`) или возьмите файлы из
 `client/moonloader/`:
 
 1. Нужны [MoonLoader](https://www.blast.hk/threads/13305/) и SAMPFUNCS.
 2. Скопируйте папку `moonloader` в папку игры: `trinivoice.lua`, `lib/trinivoice/`, `resource/trinivoice/`
-   (шрифты Montserrat, лицензия OFL).
-3. Для меню установите **mimgui** (BlastHack, автор FYP). Для иконок — **fAwesome6** для mimgui (BlastHack)
-   в `moonloader/lib/fAwesome6.lua`. Для автозвонков — **SAMP.Lua**. Без fAwesome6 меню работает без иконок,
-   без mimgui остаются команды.
+   (шрифты Montserrat и Font Awesome 4.7, лицензия OFL).
+3. Для меню установите **mimgui** (BlastHack, автор FYP); без него остаются команды. Иконки — шрифт
+   Font Awesome 4.7 (`resource/trinivoice/fontawesome-webfont.ttf`) — уже в комплекте. Для автозвонков — **SAMP.Lua**.
 4. В игре: `/tv` → вкладка «Сервер» → адрес ретранслятора. Без меню: `/tv server АДРЕС 7790`.
 5. Необязательно: **32-битный** `opus.dll` в `moonloader/lib` и кодек Opus во вкладке «Звук» — лучше звук
    и меньше трафика, но `opus.dll` нужен всем, кто хочет вас слышать.
