@@ -27,6 +27,9 @@ local dt = 0.016
 local searchBuf = imgui.new.char[64]()
 local hostBuf = imgui.new.char[128]()
 local portBuf = imgui.new.char[8]()
+local freqBuf = imgui.new.char[12]()
+local passBuf = imgui.new.char[64]()
+local reportTarget -- { id, nick }, пока выбирается причина жалобы
 local meter = { bars = {}, t = 0 }
 for i = 1, 14 do meter.bars[i] = 0 end
 
@@ -261,7 +264,7 @@ local PAGES = {
   { 'HOUSE', 'Главная' },
   { 'USERS', 'Игроки рядом' },
   { 'SLIDERS', 'Звук' },
-  { 'WALKIE_TALKIE', 'Рации', soon = true },
+  { 'WALKIE_TALKIE', 'Рация' },
   { 'SERVER', 'Сервер' },
 }
 
@@ -296,16 +299,46 @@ local function drawSidebar(st, playerCount)
       tx = tx + 30
     end
     textMid(tx, y, h, p[2], active and C.white or C.soft2, active and fonts.bold or nil)
-    if p.soon then
-      local sz = textSize('скоро', fonts.small)
-      rect(x + w - sz.x - 22, y + 11, sz.x + 14, 18, C.border, 8)
-      text(x + w - sz.x - 15, y + 11 + (18 - sz.y) / 2, 'скоро', C.soft2, fonts.small)
+    if i == 4 and st.radioWire > 0 then
+      local s = ('%.1f'):format(st.radioWire / 10)
+      local sz = textSize(s, fonts.small)
+      rect(x + w - sz.x - 22, y + 11, sz.x + 14, 18, active and acc or C.border, 8)
+      text(x + w - sz.x - 15, y + 11 + (18 - sz.y) / 2, s, C.white, fonts.small)
+    elseif i == 5 and st.updateAvailable then
+      dl:AddCircleFilled(org + V(x + w - 18, y + 20), 4, u32(C.orange), 12)
     elseif i == 2 and playerCount > 0 then
       local s = tostring(playerCount)
       local sz = textSize(s, fonts.small)
       local bw = math.max(20, sz.x + 12)
       rect(x + w - bw - 8, y + 10, bw, 20, active and acc or C.border, 10)
       text(x + w - bw - 8 + (bw - sz.x) / 2, y + 10 + (20 - sz.y) / 2, s, C.white, fonts.small)
+    end
+  end
+
+  -- звонок
+  local cl = ctx.call()
+  if cl then
+    local cy, ch = H - 76 - 14 - 124, 124
+    local ringing = cl.state ~= 'active'
+    local pulse = ringing and (0.5 + 0.5 * math.sin(imgui.GetTime() * 6)) or 0
+    rect(14, cy, SIDE - 28, ch, mix(hex('15171E'), C.green, 0.06 + 0.06 * pulse), 12)
+    frame(14, cy, SIDE - 28, ch, mix(C.border, C.green, 0.4 + 0.4 * pulse), 12)
+    local title = cl.state == 'in' and 'Входящий звонок' or (cl.state == 'out' and 'Вызов...' or 'Разговор')
+    local ph = icon('PHONE')
+    local tx = 26
+    if ph ~= '' then textMid(tx, cy + 10, 20, ph, C.greenText); tx = tx + 22 end
+    textMid(tx, cy + 10, 20, title, C.greenText, fonts.bold)
+    text(26, cy + 36, cl.peerNick, C.white, fonts.bold)
+    local sub = cl.state == 'active' and ('%02d:%02d'):format(math.floor(cl.duration / 60), math.floor(cl.duration) % 60)
+      or ('ID ' .. cl.peerId)
+    text(26, cy + 56, sub, C.muted, fonts.small)
+    local bw = SIDE - 28 - 24
+    if cl.state == 'in' then
+      local hw2 = (bw - 8) / 2
+      if button('##accept', 26, cy + 80, hw2, 32, 'Ответить', true) then ctx.acceptCall() end
+      if button('##decline', 26 + hw2 + 8, cy + 80, hw2, 32, 'Сбросить') then ctx.hangup() end
+    else
+      if button('##hangup', 26, cy + 80, bw, 32, 'Положить трубку') then ctx.hangup() end
     end
   end
 
@@ -367,7 +400,8 @@ end
 
 local function pageHome(st)
   local m = ctx.cfg.main
-  header('Главная', m.enabled and 'Вас слышат игроки рядом с вами' or 'Голосовой чат выключен')
+  header('Главная', st.muted and 'Голос выключен администратором ретранслятора'
+    or (m.enabled and 'Вас слышат игроки рядом с вами' or 'Голосовой чат выключен'))
   local tw = textSize('Включён', fonts.bold).x
   text(W - 26 - 32 - 12 - 46 - 10 - tw, 30, m.enabled and 'Включён' or 'Выключен', C.soft2, fonts.bold)
   if toggle('##enabled', W - 26 - 32 - 12 - 46, 25, m.enabled) then ctx.setEnabled(not m.enabled) end
@@ -376,9 +410,12 @@ local function pageHome(st)
   local y = 86
   card(X0, y, CW, 128)
   sectionTitle(X0 + 16, y + 14, 'Дальность речи')
-  local icons = { icon('EAR_LISTEN'), icon('COMMENT'), icon('BULLHORN') }
+  local icons = { icon('EAR_LISTEN'), icon('COMMENT'), icon('VOLUME_HIGH') }
   local subs = { '3 м', '15 м', '40 м' }
   local names = { 'Шёпот', 'Обычный', 'Крик' }
+  if st.inServiceVehicle and m.megaphone then
+    icons[3], subs[3], names[3] = icon('BULLHORN'), '60 м', 'Мегафон'
+  end
   local tw3 = (CW - 32 - 20) / 3
   for i = 1, 3 do
     if tile('##mode' .. i, X0 + 16 + (i - 1) * (tw3 + 10), y + 40, tw3, 74, icons[i], names[i], subs[i], m.mode == i) then
@@ -448,6 +485,24 @@ local function pagePlayers(st)
   imgui.PopStyleVar(2)
   local query = ffi.string(searchBuf):lower()
 
+  if reportTarget then
+    local y = 86
+    card(X0, y, CW, 320)
+    sectionTitle(X0 + 16, y + 14, 'Жалоба на ' .. reportTarget.nick)
+    text(X0 + 16, y + 40, 'Последние 30 секунд его голоса сохранятся у вас как WAV-файл,', C.muted, fonts.small)
+    text(X0 + 16, y + 58, 'а жалоба уйдёт администрации ретранслятора.', C.muted, fonts.small)
+    local reasons = { 'Оскорбления', 'Музыка и шум в микрофон', 'Помехи и спам в рации', 'Нарушение правил сервера' }
+    for i, r in ipairs(reasons) do
+      if button('##reason' .. i, X0 + 16, y + 86 + (i - 1) * 44, CW - 32, 36, r) then
+        ctx.report(reportTarget.id, r)
+        reportTarget = nil
+        return
+      end
+    end
+    if button('##reportCancel', X0 + 16, y + 270, 140, 34, 'Отмена') then reportTarget = nil end
+    return
+  end
+
   local list = {}
   for _, p in ipairs(ctx.players()) do
     if query == '' or p.nick:lower():find(query, 1, true) or tostring(p.id) == query then list[#list + 1] = p end
@@ -496,7 +551,7 @@ local function pagePlayers(st)
     rect(262, y + 19, 64, 22, C.key, 8)
     text(262 + (64 - dsz.x) / 2, y + 19 + (22 - dsz.y) / 2, dist, C.soft, fonts.small)
 
-    local sx, sw = 262 + 64 + 16, CW - (262 + 64 + 16) - 110
+    local sx, sw = 262 + 64 + 16, CW - (262 + 64 + 16) - 190
     local vol = p.muted and 0 or p.volume
     if p.muted then
       rect(sx, y + 27, sw, 6, hex('22242C'), 3)
@@ -506,7 +561,18 @@ local function pagePlayers(st)
     end
     local vs = vol .. '%'
     local vsz = textSize(vs, fonts.bold)
-    text(CW - 60 - vsz.x, y + 30 - vsz.y / 2, vs, p.muted and C.muted or C.white, fonts.bold)
+    text(CW - 140 - vsz.x, y + 30 - vsz.y / 2, vs, p.muted and C.muted or C.white, fonts.bold)
+    local inCall = ctx.call() ~= nil
+    local pico = icon('PHONE')
+    if pico == '' then pico = 'тел' end
+    if iconButton('##call' .. p.nick, CW - 128, y + 13, 34, pico, inCall and C.muted or C.soft, C.key) and not inCall then
+      ctx.callPlayer(p.id)
+    end
+    local fico = icon('FLAG')
+    if fico == '' then fico = '!' end
+    if iconButton('##report' .. p.nick, CW - 88, y + 13, 34, fico, C.soft, C.key) then
+      reportTarget = { id = p.id, nick = p.nick }
+    end
     local ico = p.muted and icon('VOLUME_XMARK') or icon('VOLUME_HIGH')
     if ico == '' then ico = p.muted and 'вкл' or 'выкл' end
     if iconButton('##mute' .. p.nick, CW - 48, y + 13, 34, ico, p.muted and C.redText or C.soft,
@@ -556,7 +622,7 @@ local function pageSound(st)
   text(mx + 16, y + 150, 'оранжевая линия на шкале — порог', C.muted, fonts.small)
 
   y = 276
-  card(X0, y, hw, 150)
+  card(X0, y, hw, 164)
   sectionTitle(X0 + 16, y + 14, 'Кодек')
   local sel = segmented('##codec', X0 + 16, y + 42, hw - 32, 36, { 'u-law', 'Opus' }, m.codec == 'opus' and 2 or 1)
   if sel then ctx.setCodec(sel == 2 and 'opus' or 'ulaw') end
@@ -565,40 +631,131 @@ local function pageSound(st)
   text(X0 + 16, y + 94, note, st.opusAvailable and C.muted or C.orangeText, fonts.small)
   text(X0 + 16, y + 114, 'u-law работает у всех без доп. файлов', C.muted, fonts.small)
 
-  card(mx, y, hw, 150)
-  sectionTitle(mx + 16, y + 14, 'Отображение')
-  local toggles = { { 'Метки над головой', 'show_icons' }, { 'Строка состояния', 'show_hud' } }
-  for i, t in ipairs(toggles) do
-    local ry = y + 42 + (i - 1) * 34
+  card(mx, y, hw, 164)
+  sectionTitle(mx + 16, y + 14, 'Эффекты')
+  local fx = {
+    { 'Приглушение за стенами', 'occlusion' },
+    { 'Эффект рации и телефона', 'fx_radio' },
+    { 'Мегафон в спецмашине', 'megaphone' },
+    { 'Звук нажатия клавиши', 'ptt_sound' },
+  }
+  for i, t in ipairs(fx) do
+    local ry = y + 40 + (i - 1) * 30
     textMid(mx + 16, ry, 26, t[1], C.soft)
-    if toggle('##t' .. t[2], mx + hw - 16 - 46, ry, m[t[2]]) then ctx.set(t[2], not m[t[2]]) end
+    if toggle('##fx' .. t[2], mx + hw - 16 - 46, ry, m[t[2]]) then ctx.set(t[2], not m[t[2]]) end
   end
-  textMid(mx + 16, y + 112, 26, 'Цвет', C.soft)
+
+  y = 454
+  card(X0, y, CW, 70)
+  sectionTitle(X0 + 16, y + 12, 'Отображение')
+  local toggles = { { 'Метки', 'show_icons' }, { 'Строка состояния', 'show_hud' } }
+  local tx = X0 + 16
+  for _, t in ipairs(toggles) do
+    textMid(tx, y + 34, 26, t[1], C.soft)
+    tx = tx + textSize(t[1]).x + 10
+    if toggle('##t' .. t[2], tx, y + 34, m[t[2]]) then ctx.set(t[2], not m[t[2]]) end
+    tx = tx + 46 + 24
+  end
+  textMid(tx, y + 34, 26, 'Цвет', C.soft)
+  tx = tx + textSize('Цвет').x + 10
   for i, a in ipairs(ACCENTS) do
-    local cx = mx + hw - 16 - (5 - i) * 30 + 4
-    local _, hov = hit('##acc' .. i, cx, y + 112, 26, 26)
+    local cx = tx + (i - 1) * 30
+    local _, hov = hit('##acc' .. i, cx, y + 34, 26, 26)
     if imgui.IsItemClicked(0) then ctx.set('accent', a) end
-    local cc = org + V(cx + 13, y + 125)
+    local cc = org + V(cx + 13, y + 47)
     if m.accent == a then dl:AddCircleFilled(cc, 13, u32(C.white), 24) end
     dl:AddCircleFilled(cc, (m.accent == a or hov) and 10 or 9, u32(hex(a)), 24)
   end
 end
 
-local function pageRadio()
-  header('Рации', 'Связь фракций на своих частотах')
-  card(X0, 86, CW, 200)
-  local ico = icon('WALKIE_TALKIE')
-  if ico ~= '' then
-    local sz = textSize(ico, fonts.icon)
-    text(X0 + (CW - sz.x) / 2, 120, ico, acc, fonts.icon)
+local function pageRadio(st)
+  local m = ctx.cfg.main
+  local on = m.radio_on
+  header('Рация', on and ('Частота %.1f МГц · на частоте ещё %d'):format(st.radioWire / 10, st.radioListeners)
+    or 'Связь на частоте на любом расстоянии')
+  local lbl = on and 'Включена' or 'Выключена'
+  local tw = textSize(lbl, fonts.bold).x
+  text(W - 26 - 32 - 12 - 46 - 10 - tw, 30, lbl, C.soft2, fonts.bold)
+  if toggle('##radioOn', W - 26 - 32 - 12 - 46, 25, on) then ctx.setRadio(not on) end
+
+  -- частота
+  local y = 86
+  card(X0, y, CW, 140)
+  sectionTitle(X0 + 16, y + 14, 'Частота')
+  local f = ('%.1f'):format(tonumber(m.radio_freq) or 0)
+  local fsz = textSize(f, fonts.title)
+  text(X0 + 16, y + 44, f, on and C.white or C.soft2, fonts.title)
+  text(X0 + 22 + fsz.x, y + 44 + fsz.y - 18, 'МГц', C.muted)
+  local steps = { { '-1', -1 }, { '-0.1', -0.1 }, { '+0.1', 0.1 }, { '+1', 1 } }
+  for i, sp in ipairs(steps) do
+    if button('##step' .. i, X0 + 16 + (i - 1) * 60, y + 92, 52, 32, sp[1]) then
+      local nf = math.floor(((tonumber(m.radio_freq) or 100) + sp[2]) * 10 + 0.5) / 10
+      if ctx.setRadio(nil, nf) then imgui.StrCopy(freqBuf, ('%.1f'):format(nf)) end
+    end
   end
-  local t1 = 'Появятся в следующей версии'
-  local s1 = textSize(t1, fonts.bold)
-  text(X0 + (CW - s1.x) / 2, 162, t1, C.white, fonts.bold)
-  local lines = { 'Частоты LSPD, EMS и других фракций', 'эффект рации и щелчки в начале и конце фразы' }
-  for i, l in ipairs(lines) do
-    local s = textSize(l)
-    text(X0 + (CW - s.x) / 2, 190 + (i - 1) * 22, l, C.muted)
+  imgui.PushStyleVarFloat(imgui.StyleVar.FrameRounding, 9)
+  imgui.PushStyleVarVec2(imgui.StyleVar.FramePadding, V(10, 9))
+  imgui.SetCursorPos(V(X0 + CW - 16 - 130 - 10 - 120, y + 92))
+  imgui.SetNextItemWidth(120)
+  imgui.InputTextWithHint('##freq', '911.0', freqBuf, ffi.sizeof(freqBuf))
+  imgui.PopStyleVar(2)
+  if button('##setFreq', X0 + CW - 16 - 130, y + 92, 130, 34, 'Настроить', true) then
+    ctx.setRadio(true, ffi.string(freqBuf))
+  end
+
+  -- пароль и управление
+  y = 240
+  local hw = (CW - 14) / 2
+  card(X0, y, hw, 150)
+  sectionTitle(X0 + 16, y + 14, 'Пароль частоты')
+  text(X0 + 16, y + 40, 'Нужен для закрытых частот фракций', C.muted, fonts.small)
+  imgui.PushStyleVarFloat(imgui.StyleVar.FrameRounding, 9)
+  imgui.PushStyleVarVec2(imgui.StyleVar.FramePadding, V(10, 9))
+  imgui.SetCursorPos(V(X0 + 16, y + 64))
+  imgui.SetNextItemWidth(hw - 32)
+  imgui.InputTextWithHint('##radioPass', 'пароль от лидера фракции', passBuf, ffi.sizeof(passBuf), imgui.InputTextFlags.Password)
+  imgui.PopStyleVar(2)
+  if button('##savePass', X0 + 16, y + 106, 120, 32, 'Сохранить') then ctx.set('radio_pass', ffi.string(passBuf)) end
+
+  local mx = X0 + hw + 14
+  card(mx, y, hw, 150)
+  sectionTitle(mx + 16, y + 14, 'Управление')
+  local bind = ctx.binding()
+  local ry = y + 42
+  local tx = mx + 16
+  local ki = icon('KEYBOARD')
+  if ki ~= '' then textMid(tx, ry, 30, ki, C.muted); tx = tx + 26 end
+  textMid(tx, ry, 30, 'Говорить в рацию', C.soft)
+  local label = bind == 'radio' and 'нажмите клавишу' or ctx.keyName(m.radio_key)
+  if keycap('##keyradio', mx + hw - 16, ry, label, bind == 'radio') then ctx.startBinding('radio') end
+  text(mx + 16, y + 88, 'Громкость рации', C.soft)
+  local rv = ('%d%%'):format(m.radio_volume)
+  local rsz = textSize(rv, fonts.bold)
+  text(mx + hw - 16 - rsz.x, y + 88, rv, C.white, fonts.bold)
+  local nv = slider('##radioVol', mx + 16, y + 124, hw - 32, m.radio_volume, 0, 100)
+  if nv then ctx.set('radio_volume', nv) end
+
+  -- избранные частоты
+  y = 404
+  card(X0, y, CW, 100)
+  sectionTitle(X0 + 16, y + 14, 'Избранные частоты')
+  local presets = ctx.radioPresets()
+  if #presets == 0 then
+    text(X0 + 16, y + 44, 'Добавьте в trinivoice.ini раздел [radio_presets], например:', C.muted, fonts.small)
+    text(X0 + 16, y + 64, 'LSPD=911.0    EMS=912.0    Такси=150.5', C.soft, fonts.small)
+  else
+    local cx = X0 + 16
+    for i, pr in ipairs(presets) do
+      local label2 = ('%s  %.1f'):format(pr.name, pr.freq)
+      local w = textSize(label2, fonts.bold).x + 24
+      if cx + w > X0 + CW - 16 then break end
+      local activeP = on and math.abs((tonumber(m.radio_freq) or 0) - pr.freq) < 0.05
+      if button('##preset' .. i, cx, y + 46, w, 34, label2, activeP) then
+        ctx.setRadio(true, pr.freq)
+        imgui.StrCopy(freqBuf, ('%.1f'):format(pr.freq))
+      end
+      cx = cx + w + 8
+    end
   end
 end
 
@@ -625,7 +782,7 @@ local function pageServer(st)
   end
 
   y = 232
-  card(X0, y, CW, 196)
+  card(X0, y, CW, 252)
   sectionTitle(X0 + 16, y + 14, 'Состояние')
   local rows = {
     { 'Связь', st.connected and 'на связи' or 'нет связи', st.connected and C.greenText or C.redText },
@@ -633,6 +790,8 @@ local function pageServer(st)
     { 'Игроков с голосом на сервере', st.connected and tostring(st.online) or '—', C.white },
     { 'Комната (SA-MP сервер)', st.room or '—', C.white },
     { 'Ваш кодек', st.codec, C.white },
+    { 'Версия скрипта', ctx.version, C.white },
+    { 'Последняя версия', st.latest ~= '' and st.latest or '—', st.updateAvailable and C.orangeText or C.white },
   }
   for i, r in ipairs(rows) do
     local ry = y + 44 + (i - 1) * 28
@@ -641,7 +800,9 @@ local function pageServer(st)
     text(X0 + CW - 16 - sz.x, ry, r[2], r[3], fonts.bold)
     if i < #rows then rect(X0 + 16, ry + 22, CW - 32, 1, C.border) end
   end
-  text(X0, y + 210, 'Адрес ретранслятора выдаёт его владелец. Настройки сохраняются в trinivoice.ini.', C.muted, fonts.small)
+  local note = st.updateAvailable and ('Доступна версия ' .. st.latest .. ': скачайте её у владельца ретранслятора.')
+    or 'Адрес ретранслятора выдаёт его владелец. Настройки сохраняются в trinivoice.ini.'
+  text(X0, y + 264, note, st.updateAvailable and C.orangeText or C.muted, fonts.small)
 end
 
 ---------------------------------------------------------------------------
@@ -738,7 +899,7 @@ local function drawWindow()
     if page == 1 then pageHome(st)
     elseif page == 2 then pagePlayers(st)
     elseif page == 3 then pageSound(st)
-    elseif page == 4 then pageRadio()
+    elseif page == 4 then pageRadio(st)
     else pageServer(st) end
   end
   imgui.End()
@@ -766,6 +927,9 @@ function M.open()
   local m = ctx.cfg.main
   imgui.StrCopy(hostBuf, m.host)
   imgui.StrCopy(portBuf, tostring(m.port))
+  imgui.StrCopy(freqBuf, ('%.1f'):format(tonumber(m.radio_freq) or 100))
+  imgui.StrCopy(passBuf, tostring(m.radio_pass or ''))
+  reportTarget = nil
   show[0] = true
 end
 function M.close() show[0] = false end

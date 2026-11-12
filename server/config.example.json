@@ -1,9 +1,20 @@
 {
   "host": "0.0.0.0",
   "port": 7790,
+  "dataDir": "data",
   "allowedRooms": [],
   "bannedNicks": [],
+  "radioPasswords": {
+    "911.0": "сменить-пароль-lspd"
+  },
+  "admins": [
+    { "name": "Admin", "key": "замените-на-длинный-случайный-ключ" }
+  ],
+  "latestClientVersion": "0.3.0",
+  "minClientVersion": "0.3.0",
   "clientTimeoutMs": 10000,
+  "callRingTimeoutMs": 30000,
+  "reportCooldownMs": 30000,
   "maxVoicePacketsPerSec": 60,
   "maxPayloadBytes": 512,
   "rangeMargin": 1.25,

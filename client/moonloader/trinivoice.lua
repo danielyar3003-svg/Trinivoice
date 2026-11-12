@@ -1,272 +1,22 @@
--- TriniVoice: голосовой чат по близости для SA-MP (Trinity RP).
+-- TriniVoice: голосовой чат для SA-MP (Trinity RP).
 -- Клиентский скрипт MoonLoader. Звук пишется и играется через bass.dll
 -- клиента SA-MP и передаётся через внешний UDP-ретранслятор (папка server/).
--- Файл в UTF-8: русский текст переводится в CP1251 при выводе (функция cp).
+-- Файл в UTF-8: русский текст переводится в CP1251 при выводе в чат.
+--
+-- Модули (moonloader/lib/trinivoice/):
+--   protocol.lua  протокол обмена с ретранслятором
+--   audio.lua     кодеки, эффекты (рация, телефон, мегафон, стены), служебные звуки, WAV
+--   ui.lua        меню /tv на mimgui (необязательно)
 
+local SCRIPT_VERSION = '0.3.0'
 script_name('TriniVoice')
 script_author('TriniVoice')
-script_version('0.1.0')
-script_description('Proximity voice chat for SA-MP via external relay')
+script_version(SCRIPT_VERSION)
+script_description('Voice chat for SA-MP via external relay: proximity, radio, phone')
 
 local ffi = require 'ffi'
-local bit = require 'bit'
-
-local VERSION = 1
-local HDR = 'TV' .. string.char(VERSION)
-local C_STATE, C_VOICE, C_BYE = 0x01, 0x02, 0x03
-local S_ACK, S_VOICE = 0x81, 0x82
-
-local MODE_RANGE = { 3, 15, 40 }                       -- шёпот, обычный, крик (метры)
-local MODE_NAME = { 'шёпот', 'обычный', 'крик' }
-local MODE_COLOR = { 0xFFB0B0B0, 0xFF5BD75B, 0xFFFF9A3C }
-local ACK_TEXT = {
-  [1] = 'этот SA-MP сервер не разрешён на ретрансляторе',
-  [2] = 'ваш ID уже занят другим клиентом',
-  [3] = 'вам запрещён голосовой чат',
-}
-
-local CODEC_ULAW, CODEC_OPUS = 1, 2
-local FRAME_MS = 20
-local STATE_INTERVAL = 0.2   -- сек между отправками позиции
-local SPEAKER_IDLE = 5.0     -- сек тишины, после которых поток собеседника освобождается
-local MAX_QUEUE_SEC = 0.4    -- больше этого в очереди воспроизведения не копим
-
----------------------------------------------------------------------------
--- Утилиты
----------------------------------------------------------------------------
-
--- UTF-8 -> CP1251 (кириллица + ASCII), остальное заменяется на '?'
-local function cp(s)
-  local out, i, n = {}, 1, #s
-  while i <= n do
-    local c = s:byte(i)
-    if c < 0x80 then
-      out[#out + 1] = string.char(c); i = i + 1
-    elseif c >= 0xC0 and c < 0xE0 and i < n then
-      local u = bit.bor(bit.lshift(bit.band(c, 0x1F), 6), bit.band(s:byte(i + 1), 0x3F))
-      if u >= 0x410 and u <= 0x44F then out[#out + 1] = string.char(u - 0x410 + 0xC0)
-      elseif u == 0x401 then out[#out + 1] = '\168'
-      elseif u == 0x451 then out[#out + 1] = '\184'
-      else out[#out + 1] = '?' end
-      i = i + 2
-    else
-      out[#out + 1] = '?'
-      i = i + (c >= 0xF0 and 4 or (c >= 0xE0 and 3 or 1))
-    end
-  end
-  return table.concat(out)
-end
-
-local function clamp(v, lo, hi) if v < lo then return lo elseif v > hi then return hi end return v end
-
-local function u16(n) return string.char(bit.band(n, 0xFF), bit.band(bit.rshift(n, 8), 0xFF)) end
-local function rd16(s, i) return s:byte(i) + s:byte(i + 1) * 256 end
-local f32buf = ffi.new('float[1]')
-local function f32(x) f32buf[0] = x; return ffi.string(f32buf, 4) end
-
----------------------------------------------------------------------------
--- Протокол (см. docs/PROTOCOL.md)
----------------------------------------------------------------------------
-
-local function packState(id, x, y, z, interior, room, nick)
-  return HDR .. string.char(C_STATE) .. u16(id) .. f32(x) .. f32(y) .. f32(z) ..
-    string.char(bit.band(interior, 0xFF)) ..
-    string.char(#room) .. room .. string.char(#nick) .. nick
-end
-
-local function packVoice(seq, mode, codec, payload)
-  return HDR .. string.char(C_VOICE) .. u16(seq) .. string.char(mode, codec) .. payload
-end
-
-local function packBye() return HDR .. string.char(C_BYE) end
-
--- Разбор пакета сервера. Возвращает таблицу или nil.
-local function parseServer(s)
-  if #s < 4 or s:sub(1, 3) ~= HDR then return nil end
-  local t = s:byte(4)
-  if t == S_ACK and #s >= 7 then
-    return { type = t, status = s:byte(5), online = rd16(s, 6) }
-  elseif t == S_VOICE and #s > 10 then
-    return { type = t, speaker = rd16(s, 5), seq = rd16(s, 7), mode = s:byte(9),
-             codec = s:byte(10), payload = s:sub(11) }
-  end
-  return nil
-end
-
----------------------------------------------------------------------------
--- Кодеки
----------------------------------------------------------------------------
-
--- G.711 u-law, 8 кГц: работает без дополнительных библиотек.
-local ulawEnc = ffi.new('uint8_t[65536]')
-local ulawDec = ffi.new('int16_t[256]')
-do
-  local BIAS, CLIP = 0x84, 32635
-  for s = -32768, 32767 do
-    local v, sign = s, 0
-    if v < 0 then v = -v; sign = 0x80 end
-    if v > CLIP then v = CLIP end
-    v = v + BIAS
-    local exp, mask = 7, 0x4000
-    while exp > 0 and bit.band(v, mask) == 0 do exp = exp - 1; mask = bit.rshift(mask, 1) end
-    local mant = bit.band(bit.rshift(v, exp + 3), 0x0F)
-    ulawEnc[s + 32768] = bit.band(bit.bnot(bit.bor(sign, bit.lshift(exp, 4), mant)), 0xFF)
-  end
-  for u = 0, 255 do
-    local x = bit.band(bit.bnot(u), 0xFF)
-    local exp, mant = bit.band(bit.rshift(x, 4), 7), bit.band(x, 0x0F)
-    local v = bit.lshift(bit.lshift(mant, 3) + BIAS, exp) - BIAS
-    ulawDec[u] = bit.band(x, 0x80) ~= 0 and -v or v
-  end
-end
-
-local function makeUlaw()
-  local rate = 8000
-  local n = rate * FRAME_MS / 1000
-  local out = ffi.new('uint8_t[?]', n)
-  local pcm = ffi.new('int16_t[?]', n)
-  return {
-    id = CODEC_ULAW, rate = rate, frame = n,
-    encode = function(src, count)
-      for i = 0, count - 1 do out[i] = ulawEnc[src[i] + 32768] end
-      return ffi.string(out, count)
-    end,
-    newDecoder = function()
-      return {
-        decode = function(_, data)
-          local len = math.min(#data, n)
-          for i = 0, len - 1 do pcm[i] = ulawDec[data:byte(i + 1)] end
-          return pcm, len
-        end,
-        conceal = function() return nil, 0 end,
-        free = function() end,
-      }
-    end,
-  }
-end
-
--- Opus, 16 кГц: нужен 32-битный opus.dll в moonloader/lib (у всех собеседников).
-local opusLib
-local function loadOpus(dir)
-  if opusLib ~= nil then return opusLib or nil end
-  opusLib = false
-  pcall(ffi.cdef, [[
-    typedef struct OpusEncoder OpusEncoder;
-    typedef struct OpusDecoder OpusDecoder;
-    OpusEncoder *opus_encoder_create(int32_t Fs, int channels, int application, int *error);
-    int32_t opus_encode(OpusEncoder *st, const int16_t *pcm, int frame_size, unsigned char *data, int32_t max_data_bytes);
-    int opus_encoder_ctl(OpusEncoder *st, int request, ...);
-    void opus_encoder_destroy(OpusEncoder *st);
-    OpusDecoder *opus_decoder_create(int32_t Fs, int channels, int *error);
-    int opus_decode(OpusDecoder *st, const unsigned char *data, int32_t len, int16_t *pcm, int frame_size, int decode_fec);
-    void opus_decoder_destroy(OpusDecoder *st);
-  ]])
-  for _, name in ipairs({ dir and (dir .. '\\lib\\opus.dll') or nil, 'opus' }) do
-    local ok, lib = pcall(ffi.load, name)
-    if ok then opusLib = lib; break end
-  end
-  return opusLib or nil
-end
-
-local function makeOpus(lib, bitrate)
-  local rate = 16000
-  local n = rate * FRAME_MS / 1000
-  local err = ffi.new('int[1]')
-  local enc = lib.opus_encoder_create(rate, 1, 2048 --[[VOIP]], err)
-  if enc == nil or err[0] ~= 0 then return nil end
-  ffi.gc(enc, lib.opus_encoder_destroy)
-  lib.opus_encoder_ctl(enc, 4002 --[[SET_BITRATE]], ffi.new('int32_t', bitrate))
-  lib.opus_encoder_ctl(enc, 4012 --[[SET_INBAND_FEC]], ffi.new('int32_t', 1))
-  lib.opus_encoder_ctl(enc, 4014 --[[SET_PACKET_LOSS_PERC]], ffi.new('int32_t', 10))
-  local out = ffi.new('unsigned char[512]')
-  local pcm = ffi.new('int16_t[?]', n)
-  return {
-    id = CODEC_OPUS, rate = rate, frame = n,
-    encode = function(src, count)
-      local len = lib.opus_encode(enc, src, count, out, 512)
-      if len <= 0 then return nil end
-      return ffi.string(out, len)
-    end,
-    newDecoder = function()
-      local derr = ffi.new('int[1]')
-      local dec = lib.opus_decoder_create(rate, 1, derr)
-      if dec == nil then return nil end
-      ffi.gc(dec, lib.opus_decoder_destroy)
-      return {
-        decode = function(_, data)
-          local got = lib.opus_decode(dec, data, #data, pcm, n, 0)
-          if got < 0 then return nil, 0 end
-          return pcm, got
-        end,
-        conceal = function()
-          local got = lib.opus_decode(dec, nil, 0, pcm, n, 0)
-          if got < 0 then return nil, 0 end
-          return pcm, got
-        end,
-        free = function() end,
-      }
-    end,
-  }
-end
-
----------------------------------------------------------------------------
--- Звук и громкость
----------------------------------------------------------------------------
-
--- Громкость в зависимости от расстояния: полная в первой четверти радиуса,
--- дальше линейно до нуля на границе.
-local function distanceVolume(d, range)
-  local full = range * 0.25
-  if d <= full then return 1 end
-  return clamp(1 - (d - full) / (range - full), 0, 1)
-end
-
--- Панорама: -1 слева, 1 справа, относительно направления камеры.
-local function stereoPan(mx, my, sx, sy, fx, fy)
-  local dx, dy = sx - mx, sy - my
-  local dl = math.sqrt(dx * dx + dy * dy)
-  local fl = math.sqrt(fx * fx + fy * fy)
-  if dl < 0.5 or fl < 1e-3 then return 0 end
-  -- правый вектор для направления (fx, fy) в координатах GTA (z вверх)
-  local rx, ry = fy / fl, -fx / fl
-  return clamp((dx * rx + dy * ry) / dl, -1, 1) * 0.75
-end
-
--- Громкость микрофона (усиление) и RMS кадра для активации голосом.
-local function applyGainAndRms(buf, count, gain)
-  local sum = 0
-  for i = 0, count - 1 do
-    local v = buf[i]
-    if gain ~= 1 then
-      v = clamp(math.floor(v * gain), -32768, 32767)
-      buf[i] = v
-    end
-    sum = sum + v * v
-  end
-  return math.sqrt(sum / count)
-end
-
--- RMS кадра -> уровень 0..1 по шкале -60..0 дБ (для индикатора микрофона).
-local function levelFromRms(rms)
-  if rms < 1 then return 0 end
-  return clamp((20 * math.log10(rms / 32768) + 60) / 60, 0, 1)
-end
-
-if TRINIVOICE_TEST then
-  TV_internal = {
-    cp = cp, packState = packState, packVoice = packVoice, packBye = packBye,
-    parseServer = parseServer, makeUlaw = makeUlaw, ulawEnc = ulawEnc, ulawDec = ulawDec,
-    distanceVolume = distanceVolume, stereoPan = stereoPan, applyGainAndRms = applyGainAndRms,
-    levelFromRms = levelFromRms,
-    MODE_RANGE = MODE_RANGE,
-  }
-  return
-end
-
----------------------------------------------------------------------------
--- Всё, что ниже, работает только внутри игры
----------------------------------------------------------------------------
-
+local P = require 'trinivoice.protocol'
+local A = require 'trinivoice.audio'
 local inicfg = require 'inicfg'
 local socket = require 'socket'
 local vkeys = require 'vkeys'
@@ -277,6 +27,30 @@ if not okUi then
   print('[TriniVoice] меню недоступно: ' .. tostring(ui))
   ui = nil
 end
+-- SAMP.Lua нужен только для автозвонков по сообщениям сервера.
+local okEv, sampev = pcall(require, 'lib.samp.events')
+if not okEv then sampev = nil end
+
+local cp, clamp = A.cp, A.clamp
+
+local MODE_NAME = { 'шёпот', 'обычный', 'крик', 'мегафон', 'рация', 'телефон' }
+local MODE_COLOR = { 0xFFC8C8C8, 0xFF5BD75B, 0xFFFF9A3C, 0xFFFF6B6B, 0xFF6E8BFF, 0xFF6E8BFF }
+local ACK_TEXT = {
+  [P.ACK_ROOM] = 'этот SA-MP сервер не разрешён на ретрансляторе',
+  [P.ACK_ID_TAKEN] = 'ваш ID уже занят другим клиентом',
+  [P.ACK_BANNED] = 'вам запрещён голосовой чат на этом ретрансляторе',
+  [P.ACK_OUTDATED] = 'версия скрипта устарела: обновите TriniVoice',
+}
+-- служебный транспорт, в котором крик становится мегафоном
+local SERVICE_VEHICLES = {}
+for _, m in ipairs({ 596, 597, 598, 599, 523, 427, 490, 528, 601, 497, 430, 416, 407, 544 }) do SERVICE_VEHICLES[m] = true end
+
+local STATE_INTERVAL = 0.2   -- сек между отправками позиции
+local SPEAKER_IDLE = 5.0     -- сек тишины, после которых поток собеседника освобождается
+local MAX_QUEUE_SEC = 0.4    -- больше этого в очереди воспроизведения не копим
+local KNOWN_TTL = 300        -- сек: столько игрок остаётся в списке «Игроки рядом»
+local REPORT_SECONDS = 30
+local LOCAL_RATE = 16000     -- служебные звуки
 
 local INI = 'trinivoice.ini'
 local cfg = inicfg.load({
@@ -286,7 +60,7 @@ local cfg = inicfg.load({
     port = 7790,
     activation = 'ptt',      -- ptt | vad
     ptt_key = 0x58,          -- X
-    mode_key = 0x42,         -- B: переключить шёпот/обычный/крик
+    mode_key = 0x42,         -- B: шёпот / обычный / крик
     mode = 2,
     vad_threshold = 700,
     mic_gain = 100,          -- %
@@ -295,27 +69,63 @@ local cfg = inicfg.load({
     opus_bitrate = 24000,
     show_icons = true,
     show_hud = true,
-    accent = '#6E8BFF',      -- цвет меню
+    accent = '#6E8BFF',
+    -- рация
+    radio_on = false,
+    radio_freq = 100.0,
+    radio_pass = '',
+    radio_key = 0x5A,        -- Z
+    radio_volume = 100,
+    -- звук
+    fx_radio = true,         -- эффект рации и телефона
+    occlusion = true,        -- приглушение через стены и в машинах
+    megaphone = true,        -- крик в служебной машине = мегафон 60 м
+    ptt_sound = true,        -- щелчок / шипение при нажатии
+    ring_volume = 80,
+    -- автозвонки по сообщениям сервера (Lua-шаблоны в CP1251, захват = ник или ID)
+    phone_auto = false,
+    phone_start = '',
+    phone_end = '',
+    admin_key = '',
   },
   muted = {},
   volume = {},
+  radio_presets = {},
 }, INI)
 
 local function save() inicfg.save(cfg, INI) end
 local function msg(text) sampAddChatMessage('[TriniVoice] {FFFFFF}' .. cp(text), 0x5BD75B) end
 
-local bass
-local rec, pushProc
+local bass, rec, pushProc, fxStream
 local codec, codecs = nil, {}
 local udp
-local net = { seq = 0, lastState = 0, lastAck = -100, status = 0, online = 0, room = nil, ping = 0, stateAt = nil }
+local net = { seq = 0, lastState = 0, lastAck = -100, status = 0, online = 0, room = nil, ping = 0,
+  stateAt = nil, radioListeners = 0, mutedSec = 0, latest = '', updateNotified = false }
 local speakers = {}
-local tx = { active = false, vadUntil = 0, level = 0, monitor = false }
-local known = {}          -- игроки, которых мы слышали: id -> { nick, heard, mode }
-local KNOWN_TTL = 300     -- сек: столько игрок остаётся в списке «Игроки рядом»
-local bindTarget          -- 'ptt' | 'mode', пока ждём новую клавишу из меню
-local dirtyAt             -- когда настройки изменились (сохраняем с задержкой)
+local tx = { active = false, mode = nil, vadUntil = 0, level = 0, monitor = false, recording = false }
+local call                  -- { state = 'in'|'out'|'active', peerId, peerNick, since }
+local nextRing = 0
+local autoCall = {}         -- ник -> время, когда сервер сообщил о звонке (автозвонки)
+local known = {}            -- id -> { nick, heard, mode }: кого мы слышали рядом
+local rings = {}            -- ник -> последние 30 сек его голоса (для жалоб)
+local bindTarget            -- 'ptt' | 'mode' | 'radio', пока ждём новую клавишу из меню
+local dirtyAt
 local font
+local sounds = {}
+
+local function isConnected(now) return now - net.lastAck < 3 and (net.status == P.ACK_OK or net.status == P.ACK_MUTED) end
+local function markDirty() dirtyAt = dirtyAt or os.clock() end
+local function radioWire() return cfg.main.radio_on and P.freqToWire(cfg.main.radio_freq) or 0 end
+
+local function keyName(k)
+  local ok, name = pcall(vkeys.id_to_name, k)
+  if ok and name then return name end
+  return ('0x%02X'):format(k or 0)
+end
+
+---------------------------------------------------------------------------
+-- BASS
+---------------------------------------------------------------------------
 
 local function initBass()
   ffi.cdef [[
@@ -326,7 +136,6 @@ local function initBass()
     int __stdcall BASS_ErrorGetCode(void);
     BOOL __stdcall BASS_RecordInit(int device);
     DWORD __stdcall BASS_RecordStart(DWORD freq, DWORD chans, DWORD flags, void *proc, void *user);
-    BOOL __stdcall BASS_RecordFree(void);
     DWORD __stdcall BASS_ChannelGetData(DWORD handle, void *buffer, DWORD length);
     BOOL __stdcall BASS_ChannelPlay(DWORD handle, BOOL restart);
     BOOL __stdcall BASS_ChannelPause(DWORD handle);
@@ -339,11 +148,32 @@ local function initBass()
   local ok, lib = pcall(ffi.load, 'bass')
   if not ok then return false, 'не найден bass.dll' end
   bass = lib
-  if bass.BASS_GetDevice() == 0xFFFFFFFF then
-    bass.BASS_Init(-1, 44100, 0, nil, nil)
-  end
+  if bass.BASS_GetDevice() == 0xFFFFFFFF then bass.BASS_Init(-1, 44100, 0, nil, nil) end
   pushProc = ffi.cast('void *', ffi.cast('intptr_t', -1)) -- STREAMPROC_PUSH
+  fxStream = bass.BASS_StreamCreate(LOCAL_RATE, 1, 0, pushProc, nil)
+  if fxStream ~= 0 then bass.BASS_ChannelPlay(fxStream, 0) end
   return true
+end
+
+local function soundsFor(rate)
+  if not sounds[rate] then
+    local s = {}
+    s.click = { A.genClick(rate) }
+    s.sqOpen = { A.genSquelch(rate, 70, 0.6) }
+    s.sqClose = { A.genSquelch(rate, 160, 0.8) }
+    s.ring = { A.genTones(rate, A.RINGTONE, 7000) }
+    s.ringback = { A.genTones(rate, A.RINGBACK, 5000) }
+    sounds[rate] = s
+  end
+  return sounds[rate]
+end
+
+-- Служебный звук только для себя.
+local function playLocal(name, volume)
+  if not fxStream or fxStream == 0 then return end
+  local s = soundsFor(LOCAL_RATE)[name]
+  bass.BASS_ChannelSetAttribute(fxStream, 2, (volume or 1) * cfg.main.master_volume / 100)
+  bass.BASS_StreamPutData(fxStream, s[1], s[2] * 2)
 end
 
 local function stopRecording()
@@ -364,19 +194,18 @@ local function startRecording()
 end
 
 local function selectCodec()
-  codecs[CODEC_ULAW] = codecs[CODEC_ULAW] or makeUlaw()
-  local lib = loadOpus(getWorkingDirectory())
-  if lib and not codecs[CODEC_OPUS] then codecs[CODEC_OPUS] = makeOpus(lib, cfg.main.opus_bitrate) end
-  if cfg.main.codec == 'opus' then
-    if codecs[CODEC_OPUS] then codec = codecs[CODEC_OPUS]
-    else
-      msg('opus.dll не найден в moonloader/lib, используется u-law')
-      codec = codecs[CODEC_ULAW]
-    end
-  else
-    codec = codecs[CODEC_ULAW]
+  codecs[P.CODEC_ULAW] = codecs[P.CODEC_ULAW] or A.makeUlaw()
+  local lib = A.loadOpus(getWorkingDirectory())
+  if lib and not codecs[P.CODEC_OPUS] then codecs[P.CODEC_OPUS] = A.makeOpus(lib, cfg.main.opus_bitrate) end
+  if cfg.main.codec == 'opus' and not codecs[P.CODEC_OPUS] then
+    msg('opus.dll не найден в moonloader/lib, используется u-law')
   end
+  codec = (cfg.main.codec == 'opus' and codecs[P.CODEC_OPUS]) or codecs[P.CODEC_ULAW]
 end
+
+---------------------------------------------------------------------------
+-- Сеть
+---------------------------------------------------------------------------
 
 local function openSocket()
   if udp then udp:close() end
@@ -401,18 +230,73 @@ local function roomFor(host, port)
 end
 
 ---------------------------------------------------------------------------
+-- Игровые проверки
+---------------------------------------------------------------------------
+
+local function speakerPed(id)
+  local ok, ped = sampGetCharHandleBySampPlayerId(id)
+  if ok and doesCharExist(ped) then return ped end
+  return nil
+end
+
+local function carOf(ped)
+  if isCharInAnyCar(ped) then return storeCarCharIsInNoSave(ped) end
+  return nil
+end
+
+local function inServiceVehicle(ped)
+  local car = carOf(ped)
+  return car ~= nil and SERVICE_VEHICLES[getCarModel(car)] == true
+end
+
+local function dist3(x1, y1, z1, x2, y2, z2) return math.sqrt((x2 - x1) ^ 2 + (y2 - y1) ^ 2 + (z2 - z1) ^ 2) end
+
+-- Насколько глухо слышно собеседника: (частота среза или nil, множитель громкости).
+local function occlusion(ped)
+  if not cfg.main.occlusion then return nil, 1 end
+  local mx, my, mz = getCharCoordinates(PLAYER_PED)
+  local sx, sy, sz = getCharCoordinates(ped)
+  if not isLineOfSightClear(mx, my, mz + 0.6, sx, sy, sz + 0.6, true, false, false, true, false) then
+    return 700, 0.55 -- стена
+  end
+  if carOf(PLAYER_PED) ~= carOf(ped) then return 1800, 0.8 end -- один из нас в машине
+  return nil, 1
+end
+
+local function findPlayerId(nick)
+  local lower = nick:lower()
+  for id = 0, sampGetMaxPlayerId(false) do
+    if sampIsPlayerConnected(id) and sampGetPlayerNickname(id):lower() == lower then return id end
+  end
+  return nil
+end
+
+---------------------------------------------------------------------------
 -- Передача
 ---------------------------------------------------------------------------
 
 local function canTalk()
   if not cfg.main.enabled or not sampIsLocalPlayerSpawned() then return false end
-  if isCharDead(PLAYER_PED) then return false end
+  if isCharDead(PLAYER_PED) or net.status == P.ACK_MUTED then return false end
   return true
 end
 
 local function inputBusy()
   return sampIsChatInputActive() or sampIsDialogActive() or isSampfuncsConsoleActive()
     or bindTarget ~= nil or (ui ~= nil and ui.wantsText())
+end
+
+-- Каким режимом сейчас говорим (nil = молчим) и открыт ли канал без активации голосом.
+local function wantedMode()
+  if not canTalk() then return nil end
+  local m = cfg.main
+  local busy = inputBusy()
+  if radioWire() > 0 and not busy and isKeyDown(m.radio_key) then return P.MODE_RADIO, true end
+  local keyed = m.activation == 'ptt' and not busy and isKeyDown(m.ptt_key)
+  if not keyed and m.activation ~= 'vad' then return nil end
+  if call and call.state == 'active' then return P.MODE_PHONE, keyed end
+  if m.mode == P.MODE_SHOUT and m.megaphone and inServiceVehicle(PLAYER_PED) then return P.MODE_MEGAPHONE, keyed end
+  return m.mode, keyed
 end
 
 local function drainRecording()
@@ -427,9 +311,18 @@ end
 local pcmIn
 local function processCapture(now)
   if not rec then tx.level = 0; return end
-  local talk = canTalk() and (cfg.main.activation == 'vad' or (not inputBusy() and isKeyDown(cfg.main.ptt_key)))
+  local mode, forced = wantedMode()
+
+  -- звук нажатия: шипение для рации, щелчок для клавиши разговора
+  if mode ~= tx.mode and cfg.main.ptt_sound then
+    if mode == P.MODE_RADIO then playLocal('sqOpen', 0.6)
+    elseif tx.mode == P.MODE_RADIO then playLocal('sqClose', 0.6)
+    elseif mode and forced then playLocal('click', 0.5) end
+  end
+  tx.mode = mode
+
   -- пока открыто меню, микрофон пишется для индикатора, но в эфир не идёт
-  local wantRecord = talk or tx.monitor
+  local wantRecord = mode ~= nil or tx.monitor
   if wantRecord and not tx.recording then
     drainRecording()
     bass.BASS_ChannelPlay(rec, 0)
@@ -437,9 +330,7 @@ local function processCapture(now)
   elseif not wantRecord and tx.recording then
     bass.BASS_ChannelPause(rec)
     drainRecording()
-    tx.recording = false
-    tx.active = false
-    tx.level = 0
+    tx.recording, tx.active, tx.level = false, false, 0
     return
   end
   if not tx.recording then return end
@@ -456,10 +347,10 @@ local function processCapture(now)
   local sent = false
   for _ = 1, frames do
     if bass.BASS_ChannelGetData(rec, pcmIn, frameBytes) ~= frameBytes then break end
-    local rms = applyGainAndRms(pcmIn, codec.frame, gain)
-    tx.level = math.max(levelFromRms(rms), tx.level * 0.8)
-    local open = talk
-    if talk and cfg.main.activation == 'vad' then
+    local rms = A.applyGainAndRms(pcmIn, codec.frame, gain)
+    tx.level = math.max(A.levelFromRms(rms), tx.level * 0.8)
+    local open = mode ~= nil
+    if open and not forced then
       if rms >= cfg.main.vad_threshold then tx.vadUntil = now + 0.35 end
       open = now < tx.vadUntil
     end
@@ -467,7 +358,7 @@ local function processCapture(now)
       local payload = codec.encode(pcmIn, codec.frame)
       if payload then
         net.seq = (net.seq + 1) % 65536
-        sendPacket(packVoice(net.seq, cfg.main.mode, codec.id, payload))
+        sendPacket(P.packVoice(net.seq, mode, codec.id, payload))
         sent = true
       end
     end
@@ -487,32 +378,62 @@ local function freeSpeaker(id)
   end
 end
 
-local function speakerPed(id)
-  local ok, ped = sampGetCharHandleBySampPlayerId(id)
-  if ok and doesCharExist(ped) then return ped end
-  return nil
+local function ringFor(nick, rate)
+  local r = rings[nick]
+  if not r or r.rate ~= rate then
+    r = A.newRing(rate, REPORT_SECONDS)
+    rings[nick] = r
+  end
+  r.heard = os.clock()
+  return r
+end
+
+-- Обработка и отправка кадра в поток собеседника.
+local function putFrame(sp, pcm, n)
+  if not pcm or n <= 0 then return end
+  local rate = sp.codec.rate
+  if sp.route == P.ROUTE_RADIO then
+    if cfg.main.fx_radio then A.bandFx(pcm, n, rate, 'radio', sp.fx) end
+  elseif sp.route == P.ROUTE_PHONE then
+    if cfg.main.fx_radio then A.bandFx(pcm, n, rate, 'phone', sp.fx) end
+  elseif sp.mode == P.MODE_MEGAPHONE then
+    A.bandFx(pcm, n, rate, 'megaphone', sp.fx)
+  else
+    A.muffle(pcm, n, rate, sp.cutoff, sp.fx)
+  end
+  bass.BASS_StreamPutData(sp.stream, pcm, n * 2)
 end
 
 local warnedOpus = false
 local function onVoice(p, now)
   local c = codecs[p.codec]
   if not c then
-    if p.codec == CODEC_OPUS and not warnedOpus then
+    if p.codec == P.CODEC_OPUS and not warnedOpus then
       warnedOpus = true
-      msg('кто-то рядом говорит через Opus: положите opus.dll в moonloader/lib')
+      msg('кто-то говорит через Opus: положите opus.dll в moonloader/lib')
     end
     return
   end
-  if not MODE_RANGE[p.mode] or not sampIsPlayerConnected(p.speaker) then return end
+  if not P.MODE_RANGE[p.mode] or not sampIsPlayerConnected(p.speaker) then return end
   local nick = sampGetPlayerNickname(p.speaker)
-  -- проверка на месте: говорящий должен реально стоять рядом в игре
-  local ped = speakerPed(p.speaker)
-  if not ped then return end
-  local mx, my, mz = getCharCoordinates(PLAYER_PED)
-  local sx, sy, sz = getCharCoordinates(ped)
-  local d = math.sqrt((sx - mx) ^ 2 + (sy - my) ^ 2 + (sz - mz) ^ 2)
-  if d > MODE_RANGE[p.mode] * 1.3 + 3 then return end
-  known[p.speaker] = { nick = nick, heard = now, mode = p.mode }
+  local mode = p.mode
+
+  if p.route == P.ROUTE_NEAR then
+    -- проверка на месте: говорящий должен реально стоять рядом в игре
+    local ped = speakerPed(p.speaker)
+    if not ped then return end
+    if mode == P.MODE_MEGAPHONE and not inServiceVehicle(ped) then mode = P.MODE_SHOUT end
+    local mx, my, mz = getCharCoordinates(PLAYER_PED)
+    local sx, sy, sz = getCharCoordinates(ped)
+    if dist3(mx, my, mz, sx, sy, sz) > P.MODE_RANGE[mode] * 1.3 + 3 then return end
+    known[p.speaker] = { nick = nick, heard = now, mode = mode }
+  elseif p.route == P.ROUTE_RADIO then
+    if radioWire() == 0 then return end
+  elseif p.route == P.ROUTE_PHONE then
+    if not (call and call.state == 'active' and call.peerId == p.speaker) then return end
+  else
+    return
+  end
   if cfg.muted[nick] then return end
 
   local sp = speakers[p.speaker]
@@ -524,16 +445,17 @@ local function onVoice(p, now)
     if h == 0 then return end
     bass.BASS_ChannelSetAttribute(h, 2 --[[VOL]], 0)
     bass.BASS_ChannelPlay(h, 0)
-    sp = { stream = h, codec = c, dec = dec, nick = nick, lastSeq = nil, last = 0 }
+    sp = { stream = h, codec = c, dec = dec, nick = nick, last = 0, fx = A.newFxState(), occVol = 1, occAt = 0 }
     speakers[p.speaker] = sp
   end
+  sp.route, sp.mode = p.route, mode
 
+  local ring = ringFor(nick, c.rate)
   if sp.lastSeq then
     local diff = (p.seq - sp.lastSeq) % 65536
     if diff == 0 or diff > 32768 then return end -- дубликат или опоздавший пакет
     for _ = 1, math.min(diff - 1, 2) do          -- маскировка потерь
-      local pcm, n = sp.dec:conceal()
-      if pcm and n > 0 then bass.BASS_StreamPutData(sp.stream, pcm, n * 2) end
+      putFrame(sp, sp.dec:conceal())
     end
   end
   sp.lastSeq = p.seq
@@ -541,14 +463,204 @@ local function onVoice(p, now)
   local queued = bass.BASS_StreamPutData(sp.stream, nil, 0)
   if queued ~= 0xFFFFFFFF and queued > c.rate * 2 * MAX_QUEUE_SEC then return end
   if now - sp.last > 0.3 then
-    -- начало фразы: небольшой буфер тишины против рывков
-    local pad = ffi.new('int16_t[?]', c.frame * 3)
-    bass.BASS_StreamPutData(sp.stream, pad, c.frame * 3 * 2)
+    -- начало фразы: буфер против рывков (у рации — шипение открытия канала)
+    ring:gap(250)
+    if sp.route == P.ROUTE_RADIO and cfg.main.fx_radio then
+      local s = soundsFor(c.rate).sqOpen
+      bass.BASS_StreamPutData(sp.stream, s[1], s[2] * 2)
+    else
+      local pad = ffi.new('int16_t[?]', c.frame * 3)
+      bass.BASS_StreamPutData(sp.stream, pad, c.frame * 3 * 2)
+    end
   end
   local pcm, n = sp.dec:decode(p.payload)
-  if pcm and n > 0 then bass.BASS_StreamPutData(sp.stream, pcm, n * 2) end
+  if pcm and n > 0 then
+    ring:push(pcm, n)
+    putFrame(sp, pcm, n)
+  end
   sp.last = now
-  sp.mode = p.mode
+  sp.closed = false
+end
+
+local function updateSpeakers(now)
+  local mx, my, mz = getCharCoordinates(PLAYER_PED)
+  local cx, cy = getActiveCameraCoordinates()
+  local px, py = getActiveCameraPointAt()
+  local master = cfg.main.master_volume / 100
+  for id, sp in pairs(speakers) do
+    local personal = (tonumber(cfg.volume[sp.nick]) or 100) / 100
+    if sp.route == P.ROUTE_RADIO and not sp.closed and now - sp.last > 0.25 then
+      sp.closed = true
+      if cfg.main.fx_radio then
+        local s = soundsFor(sp.codec.rate).sqClose
+        bass.BASS_StreamPutData(sp.stream, s[1], s[2] * 2)
+      end
+    end
+    local ped = speakerPed(id)
+    if now - sp.last > SPEAKER_IDLE or (sp.route == P.ROUTE_NEAR and not ped) then
+      freeSpeaker(id)
+    elseif sp.route == P.ROUTE_NEAR then
+      local sx, sy, sz = getCharCoordinates(ped)
+      if now - sp.occAt > 0.25 then
+        sp.occAt = now
+        sp.cutoff, sp.occVol = occlusion(ped)
+      end
+      local vol = A.distanceVolume(dist3(mx, my, mz, sx, sy, sz), P.MODE_RANGE[sp.mode or 2]) * master * personal * sp.occVol
+      bass.BASS_ChannelSetAttribute(sp.stream, 2 --[[VOL]], vol)
+      bass.BASS_ChannelSetAttribute(sp.stream, 3 --[[PAN]], A.stereoPan(mx, my, sx, sy, px - cx, py - cy))
+    else
+      local vol = master * personal * (sp.route == P.ROUTE_RADIO and cfg.main.radio_volume / 100 or 1)
+      bass.BASS_ChannelSetAttribute(sp.stream, 2, vol)
+      bass.BASS_ChannelSetAttribute(sp.stream, 3, 0)
+    end
+  end
+  -- старые записи для жалоб не держим
+  for nick, r in pairs(rings) do
+    if now - (r.heard or 0) > KNOWN_TTL then rings[nick] = nil end
+  end
+end
+
+---------------------------------------------------------------------------
+-- Звонки
+---------------------------------------------------------------------------
+
+local function callPlayer(id)
+  if call then msg('сначала завершите текущий звонок: /tv hangup'); return end
+  if not sampIsPlayerConnected(id) then msg('игрок с таким ID не найден'); return end
+  sendPacket(P.packCall(P.CALL_INVITE, id))
+end
+
+local function acceptCall()
+  if call and call.state == 'in' then sendPacket(P.packCall(P.CALL_ACCEPT, call.peerId)) end
+end
+
+local function hangup(quiet)
+  if call then
+    sendPacket(P.packCall(P.CALL_HANGUP, call.peerId))
+    call = nil
+    if not quiet then msg('звонок завершён') end
+  end
+end
+
+local function onCall(p, now)
+  local who = ('%s [%d]'):format(p.peerNick, p.peerId)
+  if p.event == P.EV_INCOMING then
+    call = { state = 'in', peerId = p.peerId, peerNick = p.peerNick, since = now }
+    nextRing = now
+    local auto = autoCall[p.peerNick:lower()]
+    if auto and now - auto < 15 then acceptCall()
+    else msg('входящий звонок: ' .. who .. '. /tv accept - ответить, /tv decline - сбросить') end
+  elseif p.event == P.EV_RINGING then
+    call = { state = 'out', peerId = p.peerId, peerNick = p.peerNick, since = now }
+    nextRing = now
+    msg('звоним ' .. who .. '...')
+  elseif p.event == P.EV_STARTED then
+    call = { state = 'active', peerId = p.peerId, peerNick = p.peerNick, since = now }
+    msg('разговор с ' .. who .. '. Говорите клавишей разговора, /tv hangup - положить трубку')
+  elseif p.event == P.EV_ENDED then
+    if call then msg('звонок завершён') end
+    call = nil
+  elseif p.event == P.EV_UNAVAILABLE then
+    msg('абонент недоступен: нет TriniVoice рядом с сервером или не ответил')
+    if call and call.state == 'out' then call = nil end
+  elseif p.event == P.EV_BUSY then
+    -- при автозвонке оба набирают друг друга одновременно: «занято» тут ожидаемо
+    local auto = autoCall[p.peerNick:lower()]
+    if auto and now - auto < 15 then return end
+    msg('занято: ' .. (p.peerNick ~= '' and p.peerNick or ('ID ' .. p.peerId)) .. ' уже разговаривает')
+  end
+end
+
+local function processRinging(now)
+  if not call or call.state == 'active' or now < nextRing then return end
+  nextRing = now + 2
+  playLocal(call.state == 'in' and 'ring' or 'ringback', cfg.main.ring_volume / 100)
+end
+
+-- Автозвонки: сервер пишет в чат о звонке, мы сами соединяем голос.
+if sampev then
+  function sampev.onServerMessage(_, text)
+    local m = cfg.main
+    if not m.phone_auto or not text then return end
+    local start, stop = tostring(m.phone_start), tostring(m.phone_end)
+    if start ~= '' then
+      local ok, cap = pcall(string.match, text, start)
+      if ok and cap then
+        local id = tonumber(cap) or findPlayerId(cap)
+        if id and sampIsPlayerConnected(id) then
+          local nick = sampGetPlayerNickname(id)
+          autoCall[nick:lower()] = os.clock()
+          if call and call.state == 'in' and call.peerId == id then acceptCall()
+          elseif not call then sendPacket(P.packCall(P.CALL_INVITE, id)) end
+        end
+        return
+      end
+    end
+    if stop ~= '' and call then
+      local ok, hit = pcall(string.find, text, stop)
+      if ok and hit then hangup() end
+    end
+  end
+end
+
+---------------------------------------------------------------------------
+-- Жалобы и администрирование
+---------------------------------------------------------------------------
+
+-- reason в UTF-8
+local function report(id, reason)
+  if not sampIsPlayerConnected(id) then msg('игрок с таким ID не найден'); return end
+  local nick = sampGetPlayerNickname(id)
+  local r = rings[nick]
+  if r and r.filled > 0 then
+    local dir = getWorkingDirectory() .. '\\config\\trinivoice\\reports'
+    if not doesDirectoryExist(dir) then createDirectory(dir) end
+    local path = ('%s\\%s_%s.wav'):format(dir, os.date('%Y%m%d_%H%M%S'), nick)
+    local f = io.open(path, 'wb')
+    if f then
+      f:write(r:wav()); f:close()
+      msg(('запись голоса %s (%d сек) сохранена: moonloader\\config\\trinivoice\\reports'):format(nick, math.floor(r.filled / r.rate)))
+    end
+  else
+    msg('записи голоса ' .. nick .. ' нет: вы его не слышали последние 5 минут')
+  end
+  sendPacket(P.packReport(id, reason ~= '' and reason or 'без причины'))
+end
+
+local ADMIN_ACTIONS = { mute = P.ADMIN_MUTE, unmute = P.ADMIN_UNMUTE, ban = P.ADMIN_BAN, unban = P.ADMIN_UNBAN, kick = P.ADMIN_KICK }
+
+local function admin(action, nick, minutes)
+  local key = tostring(cfg.main.admin_key or '')
+  if key == '' then msg('сначала укажите ключ администратора: /tv adminkey КЛЮЧ'); return end
+  sendPacket(P.packAdmin(key, ADMIN_ACTIONS[action], nick, minutes or 0))
+end
+
+---------------------------------------------------------------------------
+-- Сетевой цикл
+---------------------------------------------------------------------------
+
+local function onAck(p, now)
+  if p.status ~= net.status then
+    if ACK_TEXT[p.status] then msg(ACK_TEXT[p.status]) end
+    if p.status == P.ACK_MUTED then
+      msg(p.mutedSec >= 0xFFFFFFFF and 'администратор выключил вам голос навсегда'
+        or ('администратор выключил вам голос на %d мин'):format(math.ceil(p.mutedSec / 60)))
+    elseif net.status == P.ACK_MUTED and p.status == P.ACK_OK then
+      msg('голос снова включён')
+    end
+  end
+  if (p.status == P.ACK_OK or p.status == P.ACK_MUTED) and now - net.lastAck > 5 then msg('подключено к голосовому серверу') end
+  net.status, net.online, net.radioListeners, net.mutedSec = p.status, p.online, p.radioListeners, p.mutedSec
+  net.lastAck = now
+  if net.stateAt and now - net.stateAt < 1 then net.ping = math.floor((now - net.stateAt) * 1000 + 0.5) end
+  net.stateAt = nil
+  if p.latestVersion ~= '' then
+    net.latest = p.latestVersion
+    if not net.updateNotified and P.compareVersions(p.latestVersion, SCRIPT_VERSION) > 0 then
+      net.updateNotified = true
+      msg(('доступна новая версия %s (у вас %s)'):format(p.latestVersion, SCRIPT_VERSION))
+    end
+  end
 end
 
 local function processNetwork(now)
@@ -556,15 +668,12 @@ local function processNetwork(now)
   for _ = 1, 300 do
     local data = udp:receive()
     if not data then break end
-    local p = parseServer(data)
-    if p and p.type == S_ACK then
-      if p.status ~= net.status and ACK_TEXT[p.status] then msg(ACK_TEXT[p.status]) end
-      if p.status == 0 and now - net.lastAck > 5 then msg('подключено к голосовому серверу') end
-      net.status, net.online, net.lastAck = p.status, p.online, now
-      if net.stateAt and now - net.stateAt < 1 then net.ping = math.floor((now - net.stateAt) * 1000 + 0.5) end
-      net.stateAt = nil
-    elseif p and p.type == S_VOICE and cfg.main.enabled then
-      onVoice(p, now)
+    local p = P.parseServer(data)
+    if p then
+      if p.type == P.S_ACK then onAck(p, now)
+      elseif p.type == P.S_VOICE then if cfg.main.enabled then onVoice(p, now) end
+      elseif p.type == P.S_CALL then onCall(p, now)
+      elseif p.type == P.S_NOTICE then msg(p.text) end
     end
   end
 
@@ -575,76 +684,72 @@ local function processNetwork(now)
       local ip, port = sampGetCurrentServerAddress()
       net.room = roomFor(ip, port)
       local x, y, z = getCharCoordinates(PLAYER_PED)
-      sendPacket(packState(id, x, y, z, getActiveInterior(), net.room, sampGetPlayerNickname(id)))
+      sendPacket(P.packState({
+        id = id, x = x, y = y, z = z, interior = getActiveInterior(), room = net.room,
+        nick = sampGetPlayerNickname(id), version = SCRIPT_VERSION,
+        radioFreq = radioWire(), radioPass = tostring(cfg.main.radio_pass or ''),
+      }))
       net.stateAt = net.stateAt or now
     end
   end
 end
 
-local function updateSpeakers(now)
-  local mx, my, mz = getCharCoordinates(PLAYER_PED)
-  local cx, cy = getActiveCameraCoordinates()
-  local px, py = getActiveCameraPointAt()
-  local master = cfg.main.master_volume / 100
-  for id, sp in pairs(speakers) do
-    local ped = speakerPed(id)
-    if now - sp.last > SPEAKER_IDLE or not ped then
-      freeSpeaker(id)
-    else
-      local sx, sy, sz = getCharCoordinates(ped)
-      local d = math.sqrt((sx - mx) ^ 2 + (sy - my) ^ 2 + (sz - mz) ^ 2)
-      local personal = (tonumber(cfg.volume[sp.nick]) or 100) / 100
-      local vol = distanceVolume(d, MODE_RANGE[sp.mode or 2]) * master * personal
-      if cfg.muted[sp.nick] then vol = 0 end
-      bass.BASS_ChannelSetAttribute(sp.stream, 2 --[[VOL]], vol)
-      bass.BASS_ChannelSetAttribute(sp.stream, 3 --[[PAN]], stereoPan(mx, my, sx, sy, px - cx, py - cy))
-    end
-  end
-end
+---------------------------------------------------------------------------
+-- Отрисовка в игре
+---------------------------------------------------------------------------
 
----------------------------------------------------------------------------
--- Отрисовка
----------------------------------------------------------------------------
+local function fmtTime(sec) sec = math.floor(sec); return ('%02d:%02d'):format(math.floor(sec / 60), sec % 60) end
 
 local function render(now)
   if cfg.main.show_icons then
     for id, sp in pairs(speakers) do
-      local ped = speakerPed(id)
-      if ped and now - sp.last < 0.3 and isCharOnScreen(ped) then
-        local x, y, z = getCharCoordinates(ped)
-        local sx, sy = convert3DCoordsToScreen(x, y, z + 1.15)
-        local text = cp('(( голос ))')
-        local w = renderGetFontDrawTextLength(font, text)
-        renderFontDrawText(font, text, sx - w / 2, sy, MODE_COLOR[sp.mode or 2])
+      if sp.route == P.ROUTE_NEAR and now - sp.last < 0.3 then
+        local ped = speakerPed(id)
+        if ped and isCharOnScreen(ped) then
+          local x, y, z = getCharCoordinates(ped)
+          local sx, sy = convert3DCoordsToScreen(x, y, z + 1.15)
+          local text = cp(sp.mode == P.MODE_MEGAPHONE and '(( мегафон ))' or '(( голос ))')
+          local w = renderGetFontDrawTextLength(font, text)
+          renderFontDrawText(font, text, sx - w / 2, sy, MODE_COLOR[sp.mode or 2])
+        end
       end
     end
   end
-  if cfg.main.show_hud and cfg.main.enabled then
-    local _, h = getScreenResolution()
-    local connected = now - net.lastAck < 3 and net.status == 0
-    local state
-    if not connected then state = 'нет связи с сервером'
-    elseif tx.active then state = 'В ЭФИРЕ'
-    elseif cfg.main.activation == 'vad' then state = 'голосовая активация'
-    else state = 'зажмите клавишу, чтобы говорить' end
-    local text = cp(('TriniVoice | %s | %s'):format(MODE_NAME[cfg.main.mode], state))
-    local color = tx.active and 0xFFFF5050 or (connected and 0xFFE0E0E0 or 0xFF909090)
-    renderFontDrawText(font, text, 20, h * 0.72, color)
+  if not (cfg.main.show_hud and cfg.main.enabled) then return end
+  local _, h = getScreenResolution()
+  local lines = {}
+  local connected = isConnected(now)
+  local state, color
+  if not connected then state, color = 'нет связи с сервером', 0xFF909090
+  elseif net.status == P.ACK_MUTED then state, color = 'голос выключен администратором', 0xFFFF7070
+  elseif tx.active then state, color = 'В ЭФИРЕ' .. (tx.mode and tx.mode > 3 and (' (' .. MODE_NAME[tx.mode] .. ')') or ''), 0xFFFF5050
+  elseif cfg.main.activation == 'vad' then state, color = 'голосовая активация', 0xFFE0E0E0
+  else state, color = ('%s - говорить'):format(keyName(cfg.main.ptt_key)), 0xFFE0E0E0 end
+  lines[#lines + 1] = { ('TriniVoice | %s | %s'):format(MODE_NAME[cfg.main.mode], state), color }
+  if radioWire() > 0 then
+    lines[#lines + 1] = { ('Рация %s | %s - говорить | на частоте: %d'):format(
+      P.freqLabel(radioWire()), keyName(cfg.main.radio_key), net.radioListeners), 0xFF9DB2FF }
+  end
+  if call then
+    local t = call.state == 'active' and ('разговор ' .. fmtTime(now - call.since))
+      or (call.state == 'in' and 'входящий звонок (/tv accept)' or 'вызов...')
+    lines[#lines + 1] = { ('Телефон: %s | %s'):format(call.peerNick, t), 0xFF7BE495 }
+  end
+  for i, l in ipairs(lines) do
+    renderFontDrawText(font, cp(l[1]), 20, h * 0.72 + (i - 1) * 16, l[2])
   end
 end
 
 ---------------------------------------------------------------------------
--- Настройки (общие для команд /tv и меню)
+-- Настройки (общие для команд и меню)
 ---------------------------------------------------------------------------
-
-local function isConnected(now) return now - net.lastAck < 3 and net.status == 0 end
-local function markDirty() dirtyAt = dirtyAt or os.clock() end
 
 local function setEnabled(on)
   cfg.main.enabled = on
   if not on then
-    sendPacket(packBye())
+    sendPacket(P.packBye())
     for id in pairs(speakers) do freeSpeaker(id) end
+    hangup()
   end
   markDirty()
 end
@@ -663,10 +768,15 @@ local function setServer(host, port)
   markDirty()
 end
 
-local function keyName(k)
-  local ok, name = pcall(vkeys.id_to_name, k)
-  if ok and name then return name end
-  return ('0x%02X'):format(k or 0)
+local function setRadio(on, freq)
+  if freq then
+    if P.freqToWire(freq) == 0 then msg('частота должна быть от 1.0 до 6553.5'); return false end
+    cfg.main.radio_freq = math.floor(tonumber(freq) * 10 + 0.5) / 10
+  end
+  if on ~= nil then cfg.main.radio_on = on end
+  for id, sp in pairs(speakers) do if sp.route == P.ROUTE_RADIO then freeSpeaker(id) end end
+  markDirty()
+  return true
 end
 
 local playersCache, playersAt = {}, -1
@@ -687,10 +797,11 @@ local function nearbyPlayers()
           local sp = speakers[id]
           list[#list + 1] = {
             id = id, nick = k.nick, mode = k.mode,
-            dist = math.sqrt((sx - mx) ^ 2 + (sy - my) ^ 2 + (sz - mz) ^ 2),
-            talking = sp ~= nil and now - sp.last < 0.3,
+            dist = dist3(mx, my, mz, sx, sy, sz),
+            talking = sp ~= nil and sp.route == P.ROUTE_NEAR and now - sp.last < 0.3,
             muted = cfg.muted[k.nick] == true,
             volume = tonumber(cfg.volume[k.nick]) or 100,
+            recorded = rings[k.nick] ~= nil,
           }
         end
       end
@@ -704,27 +815,51 @@ local function nearbyPlayers()
   return list
 end
 
+local function radioPresets()
+  local list = {}
+  for name, f in pairs(cfg.radio_presets) do
+    if P.freqToWire(f) > 0 then list[#list + 1] = { name = A.u8(tostring(name)), freq = tonumber(f) } end
+  end
+  table.sort(list, function(a, b) return a.freq < b.freq end)
+  return list
+end
+
 -- Всё, что видит и меняет меню (lib/trinivoice/ui.lua).
 local uiContext = {
   cfg = cfg,
+  version = SCRIPT_VERSION,
   status = function()
     local now = os.clock()
     return {
       connected = isConnected(now), ping = net.ping, online = net.online, room = net.room,
-      micOk = rec ~= nil, micLevel = tx.level, vadLevel = levelFromRms(cfg.main.vad_threshold),
-      codec = codec and codec.id == CODEC_OPUS and 'Opus' or 'u-law',
-      opusAvailable = codecs[CODEC_OPUS] ~= nil,
+      micOk = rec ~= nil, micLevel = tx.level, vadLevel = A.levelFromRms(cfg.main.vad_threshold),
+      codec = codec and codec.name or 'u-law', opusAvailable = codecs[P.CODEC_OPUS] ~= nil,
+      muted = net.status == P.ACK_MUTED, mutedSec = net.mutedSec,
+      latest = net.latest, updateAvailable = net.latest ~= '' and P.compareVersions(net.latest, SCRIPT_VERSION) > 0,
+      transmitting = tx.active, txMode = tx.mode,
+      radioWire = radioWire(), radioListeners = net.radioListeners,
+      inServiceVehicle = sampIsLocalPlayerSpawned() and inServiceVehicle(PLAYER_PED) or false,
     }
   end,
   players = nearbyPlayers,
+  call = function()
+    if not call then return nil end
+    return { state = call.state, peerId = call.peerId, peerNick = call.peerNick, duration = os.clock() - call.since }
+  end,
   set = function(key, value) cfg.main[key] = value; markDirty() end,
   setEnabled = setEnabled,
   setMode = function(m) cfg.main.mode = m; markDirty() end,
   setActivation = function(a) cfg.main.activation = a; markDirty() end,
   setCodec = setCodec,
   setServer = setServer,
+  setRadio = setRadio,
+  radioPresets = radioPresets,
   toggleMute = function(nick) cfg.muted[nick] = (not cfg.muted[nick]) or nil; markDirty() end,
   setVolume = function(nick, v) cfg.volume[nick] = v; markDirty() end,
+  callPlayer = callPlayer,
+  acceptCall = acceptCall,
+  hangup = hangup,
+  report = report,
   binding = function() return bindTarget end,
   startBinding = function(which) bindTarget = which end,
   keyName = keyName,
@@ -735,24 +870,22 @@ local uiContext = {
 ---------------------------------------------------------------------------
 
 local HELP = {
-  '/tv - открыть меню (без mimgui: состояние и справка)',
-  '/tv help - эта справка',
+  '/tv - меню (без mimgui: состояние и справка), /tv help - справка',
   '/tv on | off - включить или выключить голосовой чат',
-  '/tv mode 1-3 - шёпот, обычный, крик (или клавиша режима)',
-  '/tv ptt | vad - нажми и говори / активация голосом',
-  '/tv threshold N - порог активации голосом (по умолчанию 700)',
-  '/tv mute ID | unmute ID - выключить или вернуть звук игрока',
-  '/tv vol ID 0-100 - громкость игрока, /tv master 0-100 - общая',
-  '/tv gain 50-400 - усиление микрофона в процентах',
-  '/tv codec ulaw | opus - кодек (opus.dll нужен всем)',
-  '/tv icons | hud - показать или скрыть значки и строку состояния',
-  '/tv server HOST PORT - адрес ретранслятора',
+  '/tv mode 1-3 - шёпот, обычный, крик; /tv ptt | vad - клавиша или голос',
+  '/tv radio on | off | ЧАСТОТА - рация (например /tv radio 911.0), /tv radiopass ПАРОЛЬ',
+  '/tv call ID - позвонить, /tv accept - ответить, /tv decline | hangup - сбросить',
+  '/tv mute ID | unmute ID, /tv vol ID 0-100, /tv master 0-100, /tv gain 50-400',
+  '/tv report ID причина - жалоба (сохраняет запись голоса)',
+  '/tv codec ulaw | opus, /tv icons, /tv hud, /tv server HOST PORT',
+  '/tv autocall on | off, /tv autocall start|end ШАБЛОН - звонки по сообщениям сервера',
+  '/tv adminkey КЛЮЧ, /tv admin mute|unmute|ban|unban|kick НИК [минуты]',
 }
 
 local function nickById(arg)
   local id = tonumber(arg)
   if not id or not sampIsPlayerConnected(id) then msg('игрок с таким ID не найден'); return nil end
-  return sampGetPlayerNickname(id)
+  return sampGetPlayerNickname(id), id
 end
 
 local function onCommand(args)
@@ -760,24 +893,35 @@ local function onCommand(args)
   for w in args:gmatch('%S+') do a[#a + 1] = w end
   local c = (a[1] or ''):lower()
   local m = cfg.main
-  if c == '' and ui then
-    ui.toggle()
-    return
-  elseif c == '' or c == 'help' then
-    msg(('%s, сервер %s:%d, %s, игроков с голосом на сервере: %d'):format(
+  if c == '' and ui then ui.toggle(); return end
+  if c == '' or c == 'help' then
+    msg(('v%s, %s, сервер %s:%d, %s, игроков с голосом: %d'):format(SCRIPT_VERSION,
       m.enabled and 'включён' or 'выключен', m.host, m.port,
       isConnected(os.clock()) and 'на связи' or 'нет связи', net.online))
     for _, line in ipairs(HELP) do msg(line) end
     return
   elseif c == 'on' or c == 'off' then
-    setEnabled(c == 'on')
-    msg(m.enabled and 'включён' or 'выключен')
-  elseif c == 'mode' and tonumber(a[2]) and MODE_RANGE[tonumber(a[2])] then
+    setEnabled(c == 'on'); msg(m.enabled and 'включён' or 'выключен')
+  elseif c == 'mode' and tonumber(a[2]) and tonumber(a[2]) >= 1 and tonumber(a[2]) <= 3 then
     m.mode = tonumber(a[2]); msg('режим: ' .. MODE_NAME[m.mode])
   elseif c == 'ptt' or c == 'vad' then
     m.activation = c; msg(c == 'ptt' and 'режим: нажми и говори' or 'режим: активация голосом')
   elseif c == 'threshold' and tonumber(a[2]) then
     m.vad_threshold = clamp(tonumber(a[2]), 50, 20000); msg('порог: ' .. m.vad_threshold)
+  elseif c == 'radio' and a[2] then
+    if a[2] == 'on' or a[2] == 'off' then setRadio(a[2] == 'on')
+    elseif not setRadio(true, a[2]) then return end
+    msg(m.radio_on and ('рация включена, частота ' .. P.freqLabel(radioWire()) .. ', клавиша ' .. keyName(m.radio_key)) or 'рация выключена')
+  elseif c == 'radiopass' then
+    m.radio_pass = a[2] and A.u8(a[2]) or ''; msg(a[2] and 'пароль частоты задан' or 'пароль частоты сброшен')
+  elseif c == 'call' and tonumber(a[2]) then
+    callPlayer(tonumber(a[2])); return
+  elseif c == 'accept' then
+    acceptCall(); return
+  elseif c == 'decline' or c == 'hangup' then
+    hangup(); return
+  elseif c == 'report' and tonumber(a[2]) then
+    report(tonumber(a[2]), A.u8(table.concat(a, ' ', 3))); return
   elseif c == 'mute' or c == 'unmute' then
     local nick = nickById(a[2]); if not nick then return end
     cfg.muted[nick] = (c == 'mute') or nil
@@ -791,15 +935,27 @@ local function onCommand(args)
   elseif c == 'gain' and tonumber(a[2]) then
     m.mic_gain = clamp(math.floor(tonumber(a[2])), 50, 400); msg('усиление микрофона: ' .. m.mic_gain .. '%')
   elseif c == 'codec' and (a[2] == 'ulaw' or a[2] == 'opus') then
-    setCodec(a[2])
-    msg('кодек: ' .. (codec.id == CODEC_OPUS and 'opus' or 'u-law'))
+    setCodec(a[2]); msg('кодек: ' .. codec.name)
   elseif c == 'icons' then
     m.show_icons = not m.show_icons
   elseif c == 'hud' then
     m.show_hud = not m.show_hud
   elseif c == 'server' and a[2] and tonumber(a[3]) then
-    setServer(a[2], tonumber(a[3]))
-    msg('ретранслятор: ' .. m.host .. ':' .. m.port)
+    setServer(a[2], tonumber(a[3])); msg('ретранслятор: ' .. m.host .. ':' .. m.port)
+  elseif c == 'autocall' and (a[2] == 'on' or a[2] == 'off') then
+    if a[2] == 'on' and not sampev then msg('для автозвонков нужен SAMP.Lua (lib/samp/events)'); return end
+    m.phone_auto = a[2] == 'on'
+    msg(m.phone_auto and 'автозвонки включены' or 'автозвонки выключены')
+  elseif c == 'autocall' and (a[2] == 'start' or a[2] == 'end') and a[3] then
+    -- шаблон хранится как есть (CP1251), чтобы сравнивать с сообщениями сервера
+    local pattern = args:match('^%s*%S+%s+%S+%s+(.-)%s*$')
+    if not pcall(string.find, '', pattern) then msg('ошибка в шаблоне'); return end
+    m['phone_' .. a[2]] = pattern
+    msg((a[2] == 'start' and 'шаблон начала звонка: ' or 'шаблон конца звонка: ') .. A.u8(pattern))
+  elseif c == 'adminkey' then
+    m.admin_key = a[2] or ''; msg(a[2] and 'ключ администратора сохранён' or 'ключ администратора удалён')
+  elseif c == 'admin' and ADMIN_ACTIONS[a[2] or ''] and a[3] then
+    admin(a[2], a[3], tonumber(a[4])); return
   else
     msg('неизвестная команда, введите /tv help'); return
   end
@@ -842,7 +998,7 @@ function main()
   font = renderCreateFont('Arial', 9, 5)
   sampRegisterChatCommand('tv', onCommand)
   if ui then ui.init(uiContext) end
-  msg(('загружен. %s - говорить, %s - дальность, /tv - %s'):format(
+  msg(('v%s загружен. %s - говорить, %s - дальность, /tv - %s'):format(SCRIPT_VERSION,
     keyName(cfg.main.ptt_key), keyName(cfg.main.mode_key), ui and 'меню' or 'настройки'))
 
   while true do
@@ -853,6 +1009,7 @@ function main()
     if not tx.monitor then bindTarget = nil end
     processNetwork(now)
     processCapture(now)
+    processRinging(now)
     if cfg.main.enabled and sampIsLocalPlayerSpawned() then updateSpeakers(now) end
     render(now)
     if dirtyAt and now - dirtyAt > 1 then dirtyAt = nil; save() end
@@ -871,10 +1028,12 @@ function onScriptTerminate(scr)
   if scr ~= thisScript() then return end
   pcall(function()
     if dirtyAt then save() end
-    sendPacket(packBye())
+    hangup(true)
+    sendPacket(P.packBye())
     if bass then
       for id in pairs(speakers) do freeSpeaker(id) end
       stopRecording()
+      if fxStream and fxStream ~= 0 then bass.BASS_StreamFree(fxStream) end
     end
     if udp then udp:close() end
   end)

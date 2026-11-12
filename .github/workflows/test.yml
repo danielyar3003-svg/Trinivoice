@@ -1,0 +1,19 @@
+name: tests
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: sudo apt-get update && sudo apt-get install -y luajit lua-socket
+      - name: relay
+        run: cd server && npm test
+      - name: client modules
+        run: luajit client/test/run.lua
+      - name: menu on mimgui stub
+        run: luajit client/test/ui_test.lua
+      - name: end-to-end (relay + 3 clients)
+        run: client/test/e2e.sh
