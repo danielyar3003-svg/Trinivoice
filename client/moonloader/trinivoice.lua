@@ -246,11 +246,18 @@ local function applyGainAndRms(buf, count, gain)
   return math.sqrt(sum / count)
 end
 
+-- RMS кадра -> уровень 0..1 по шкале -60..0 дБ (для индикатора микрофона).
+local function levelFromRms(rms)
+  if rms < 1 then return 0 end
+  return clamp((20 * math.log10(rms / 32768) + 60) / 60, 0, 1)
+end
+
 if TRINIVOICE_TEST then
   TV_internal = {
     cp = cp, packState = packState, packVoice = packVoice, packBye = packBye,
     parseServer = parseServer, makeUlaw = makeUlaw, ulawEnc = ulawEnc, ulawDec = ulawDec,
     distanceVolume = distanceVolume, stereoPan = stereoPan, applyGainAndRms = applyGainAndRms,
+    levelFromRms = levelFromRms,
     MODE_RANGE = MODE_RANGE,
   }
   return
@@ -262,6 +269,14 @@ end
 
 local inicfg = require 'inicfg'
 local socket = require 'socket'
+local vkeys = require 'vkeys'
+
+-- Меню на mimgui. Если mimgui не установлен, работают только команды /tv.
+local okUi, ui = pcall(require, 'trinivoice.ui')
+if not okUi then
+  print('[TriniVoice] меню недоступно: ' .. tostring(ui))
+  ui = nil
+end
 
 local INI = 'trinivoice.ini'
 local cfg = inicfg.load({
@@ -280,6 +295,7 @@ local cfg = inicfg.load({
     opus_bitrate = 24000,
     show_icons = true,
     show_hud = true,
+    accent = '#6E8BFF',      -- цвет меню
   },
   muted = {},
   volume = {},
@@ -292,9 +308,13 @@ local bass
 local rec, pushProc
 local codec, codecs = nil, {}
 local udp
-local net = { seq = 0, lastState = 0, lastAck = -100, status = 0, online = 0, room = nil }
+local net = { seq = 0, lastState = 0, lastAck = -100, status = 0, online = 0, room = nil, ping = 0, stateAt = nil }
 local speakers = {}
-local tx = { active = false, vadUntil = 0 }
+local tx = { active = false, vadUntil = 0, level = 0, monitor = false }
+local known = {}          -- игроки, которых мы слышали: id -> { nick, heard, mode }
+local KNOWN_TTL = 300     -- сек: столько игрок остаётся в списке «Игроки рядом»
+local bindTarget          -- 'ptt' | 'mode', пока ждём новую клавишу из меню
+local dirtyAt             -- когда настройки изменились (сохраняем с задержкой)
 local font
 
 local function initBass()
@@ -339,6 +359,7 @@ local function startRecording()
   local h = bass.BASS_RecordStart(codec.rate, 1, 0x8000 --[[RECORD_PAUSE]], nil, nil)
   if h == 0 then return false, 'не удалось начать запись (код ' .. bass.BASS_ErrorGetCode() .. ')' end
   rec = h
+  tx.recording = false
   return true
 end
 
@@ -391,6 +412,7 @@ end
 
 local function inputBusy()
   return sampIsChatInputActive() or sampIsDialogActive() or isSampfuncsConsoleActive()
+    or bindTarget ~= nil or (ui ~= nil and ui.wantsText())
 end
 
 local function drainRecording()
@@ -404,8 +426,10 @@ end
 
 local pcmIn
 local function processCapture(now)
-  if not rec then return end
-  local wantRecord = canTalk() and (cfg.main.activation == 'vad' or (not inputBusy() and isKeyDown(cfg.main.ptt_key)))
+  if not rec then tx.level = 0; return end
+  local talk = canTalk() and (cfg.main.activation == 'vad' or (not inputBusy() and isKeyDown(cfg.main.ptt_key)))
+  -- пока открыто меню, микрофон пишется для индикатора, но в эфир не идёт
+  local wantRecord = talk or tx.monitor
   if wantRecord and not tx.recording then
     drainRecording()
     bass.BASS_ChannelPlay(rec, 0)
@@ -415,6 +439,7 @@ local function processCapture(now)
     drainRecording()
     tx.recording = false
     tx.active = false
+    tx.level = 0
     return
   end
   if not tx.recording then return end
@@ -432,8 +457,9 @@ local function processCapture(now)
   for _ = 1, frames do
     if bass.BASS_ChannelGetData(rec, pcmIn, frameBytes) ~= frameBytes then break end
     local rms = applyGainAndRms(pcmIn, codec.frame, gain)
-    local open = true
-    if cfg.main.activation == 'vad' then
+    tx.level = math.max(levelFromRms(rms), tx.level * 0.8)
+    local open = talk
+    if talk and cfg.main.activation == 'vad' then
       if rms >= cfg.main.vad_threshold then tx.vadUntil = now + 0.35 end
       open = now < tx.vadUntil
     end
@@ -479,7 +505,6 @@ local function onVoice(p, now)
   end
   if not MODE_RANGE[p.mode] or not sampIsPlayerConnected(p.speaker) then return end
   local nick = sampGetPlayerNickname(p.speaker)
-  if cfg.muted[nick] then return end
   -- проверка на месте: говорящий должен реально стоять рядом в игре
   local ped = speakerPed(p.speaker)
   if not ped then return end
@@ -487,6 +512,8 @@ local function onVoice(p, now)
   local sx, sy, sz = getCharCoordinates(ped)
   local d = math.sqrt((sx - mx) ^ 2 + (sy - my) ^ 2 + (sz - mz) ^ 2)
   if d > MODE_RANGE[p.mode] * 1.3 + 3 then return end
+  known[p.speaker] = { nick = nick, heard = now, mode = p.mode }
+  if cfg.muted[nick] then return end
 
   local sp = speakers[p.speaker]
   if sp and (sp.nick ~= nick or sp.codec ~= c) then freeSpeaker(p.speaker); sp = nil end
@@ -534,6 +561,8 @@ local function processNetwork(now)
       if p.status ~= net.status and ACK_TEXT[p.status] then msg(ACK_TEXT[p.status]) end
       if p.status == 0 and now - net.lastAck > 5 then msg('подключено к голосовому серверу') end
       net.status, net.online, net.lastAck = p.status, p.online, now
+      if net.stateAt and now - net.stateAt < 1 then net.ping = math.floor((now - net.stateAt) * 1000 + 0.5) end
+      net.stateAt = nil
     elseif p and p.type == S_VOICE and cfg.main.enabled then
       onVoice(p, now)
     end
@@ -547,6 +576,7 @@ local function processNetwork(now)
       net.room = roomFor(ip, port)
       local x, y, z = getCharCoordinates(PLAYER_PED)
       sendPacket(packState(id, x, y, z, getActiveInterior(), net.room, sampGetPlayerNickname(id)))
+      net.stateAt = net.stateAt or now
     end
   end
 end
@@ -604,11 +634,109 @@ local function render(now)
 end
 
 ---------------------------------------------------------------------------
+-- Настройки (общие для команд /tv и меню)
+---------------------------------------------------------------------------
+
+local function isConnected(now) return now - net.lastAck < 3 and net.status == 0 end
+local function markDirty() dirtyAt = dirtyAt or os.clock() end
+
+local function setEnabled(on)
+  cfg.main.enabled = on
+  if not on then
+    sendPacket(packBye())
+    for id in pairs(speakers) do freeSpeaker(id) end
+  end
+  markDirty()
+end
+
+local function setCodec(name)
+  cfg.main.codec = name
+  selectCodec()
+  local ok, err = startRecording()
+  if not ok then msg(err) end
+  markDirty()
+end
+
+local function setServer(host, port)
+  cfg.main.host, cfg.main.port = host, port
+  openSocket()
+  markDirty()
+end
+
+local function keyName(k)
+  local ok, name = pcall(vkeys.id_to_name, k)
+  if ok and name then return name end
+  return ('0x%02X'):format(k or 0)
+end
+
+local playersCache, playersAt = {}, -1
+local function nearbyPlayers()
+  local now = os.clock()
+  if now - playersAt < 0.1 then return playersCache end
+  playersAt = now
+  local list = {}
+  if sampIsLocalPlayerSpawned() then
+    local mx, my, mz = getCharCoordinates(PLAYER_PED)
+    for id, k in pairs(known) do
+      if now - k.heard > KNOWN_TTL or not sampIsPlayerConnected(id) or sampGetPlayerNickname(id) ~= k.nick then
+        known[id] = nil
+      else
+        local ped = speakerPed(id)
+        if ped then
+          local sx, sy, sz = getCharCoordinates(ped)
+          local sp = speakers[id]
+          list[#list + 1] = {
+            id = id, nick = k.nick, mode = k.mode,
+            dist = math.sqrt((sx - mx) ^ 2 + (sy - my) ^ 2 + (sz - mz) ^ 2),
+            talking = sp ~= nil and now - sp.last < 0.3,
+            muted = cfg.muted[k.nick] == true,
+            volume = tonumber(cfg.volume[k.nick]) or 100,
+          }
+        end
+      end
+    end
+    table.sort(list, function(a, b)
+      if a.talking ~= b.talking then return a.talking end
+      return a.dist < b.dist
+    end)
+  end
+  playersCache = list
+  return list
+end
+
+-- Всё, что видит и меняет меню (lib/trinivoice/ui.lua).
+local uiContext = {
+  cfg = cfg,
+  status = function()
+    local now = os.clock()
+    return {
+      connected = isConnected(now), ping = net.ping, online = net.online, room = net.room,
+      micOk = rec ~= nil, micLevel = tx.level, vadLevel = levelFromRms(cfg.main.vad_threshold),
+      codec = codec and codec.id == CODEC_OPUS and 'Opus' or 'u-law',
+      opusAvailable = codecs[CODEC_OPUS] ~= nil,
+    }
+  end,
+  players = nearbyPlayers,
+  set = function(key, value) cfg.main[key] = value; markDirty() end,
+  setEnabled = setEnabled,
+  setMode = function(m) cfg.main.mode = m; markDirty() end,
+  setActivation = function(a) cfg.main.activation = a; markDirty() end,
+  setCodec = setCodec,
+  setServer = setServer,
+  toggleMute = function(nick) cfg.muted[nick] = (not cfg.muted[nick]) or nil; markDirty() end,
+  setVolume = function(nick, v) cfg.volume[nick] = v; markDirty() end,
+  binding = function() return bindTarget end,
+  startBinding = function(which) bindTarget = which end,
+  keyName = keyName,
+}
+
+---------------------------------------------------------------------------
 -- Команды
 ---------------------------------------------------------------------------
 
 local HELP = {
-  '/tv - состояние и справка',
+  '/tv - открыть меню (без mimgui: состояние и справка)',
+  '/tv help - эта справка',
   '/tv on | off - включить или выключить голосовой чат',
   '/tv mode 1-3 - шёпот, обычный, крик (или клавиша режима)',
   '/tv ptt | vad - нажми и говори / активация голосом',
@@ -632,19 +760,17 @@ local function onCommand(args)
   for w in args:gmatch('%S+') do a[#a + 1] = w end
   local c = (a[1] or ''):lower()
   local m = cfg.main
-  if c == '' then
-    local connected = os.clock() - net.lastAck < 3 and net.status == 0
+  if c == '' and ui then
+    ui.toggle()
+    return
+  elseif c == '' or c == 'help' then
     msg(('%s, сервер %s:%d, %s, игроков с голосом на сервере: %d'):format(
       m.enabled and 'включён' or 'выключен', m.host, m.port,
-      connected and 'на связи' or 'нет связи', net.online))
+      isConnected(os.clock()) and 'на связи' or 'нет связи', net.online))
     for _, line in ipairs(HELP) do msg(line) end
     return
   elseif c == 'on' or c == 'off' then
-    m.enabled = c == 'on'
-    if not m.enabled then
-      sendPacket(packBye())
-      for id in pairs(speakers) do freeSpeaker(id) end
-    end
+    setEnabled(c == 'on')
     msg(m.enabled and 'включён' or 'выключен')
   elseif c == 'mode' and tonumber(a[2]) and MODE_RANGE[tonumber(a[2])] then
     m.mode = tonumber(a[2]); msg('режим: ' .. MODE_NAME[m.mode])
@@ -665,20 +791,17 @@ local function onCommand(args)
   elseif c == 'gain' and tonumber(a[2]) then
     m.mic_gain = clamp(math.floor(tonumber(a[2])), 50, 400); msg('усиление микрофона: ' .. m.mic_gain .. '%')
   elseif c == 'codec' and (a[2] == 'ulaw' or a[2] == 'opus') then
-    m.codec = a[2]
-    selectCodec()
-    local ok, err = startRecording()
-    if not ok then msg(err) end
+    setCodec(a[2])
     msg('кодек: ' .. (codec.id == CODEC_OPUS and 'opus' or 'u-law'))
   elseif c == 'icons' then
     m.show_icons = not m.show_icons
   elseif c == 'hud' then
     m.show_hud = not m.show_hud
   elseif c == 'server' and a[2] and tonumber(a[3]) then
-    m.host, m.port = a[2], tonumber(a[3])
-    openSocket(); msg('ретранслятор: ' .. m.host .. ':' .. m.port)
+    setServer(a[2], tonumber(a[3]))
+    msg('ретранслятор: ' .. m.host .. ':' .. m.port)
   else
-    msg('неизвестная команда, введите /tv'); return
+    msg('неизвестная команда, введите /tv help'); return
   end
   save()
 end
@@ -686,6 +809,25 @@ end
 ---------------------------------------------------------------------------
 -- Точка входа
 ---------------------------------------------------------------------------
+
+local function processKeys()
+  if cfg.main.mode_key ~= 0 and wasKeyPressed(cfg.main.mode_key) and not inputBusy() then
+    cfg.main.mode = cfg.main.mode % 3 + 1
+    if not (ui and ui.isOpen()) then msg('режим: ' .. MODE_NAME[cfg.main.mode]) end
+    markDirty()
+  end
+  -- переназначение клавиши из меню: ловим следующую нажатую (кроме ЛКМ/ПКМ и Esc)
+  if bindTarget then
+    for k = 3, 254 do
+      if k ~= 0x1B and wasKeyPressed(k) then
+        cfg.main[bindTarget .. '_key'] = k
+        bindTarget = nil
+        markDirty()
+        break
+      end
+    end
+  end
+end
 
 function main()
   if not isSampLoaded() or not isSampfuncsLoaded() then return end
@@ -699,28 +841,36 @@ function main()
   openSocket()
   font = renderCreateFont('Arial', 9, 5)
   sampRegisterChatCommand('tv', onCommand)
-  msg('загружен. Клавиша X - говорить, B - режим, /tv - настройки')
+  if ui then ui.init(uiContext) end
+  msg(('загружен. %s - говорить, %s - дальность, /tv - %s'):format(
+    keyName(cfg.main.ptt_key), keyName(cfg.main.mode_key), ui and 'меню' or 'настройки'))
 
   while true do
     wait(0)
     local now = os.clock()
-    if cfg.main.mode_key ~= 0 and wasKeyPressed(cfg.main.mode_key) and not inputBusy() then
-      cfg.main.mode = cfg.main.mode % 3 + 1
-      msg('режим: ' .. MODE_NAME[cfg.main.mode])
-      save()
-    end
+    processKeys()
+    tx.monitor = ui ~= nil and ui.isOpen()
+    if not tx.monitor then bindTarget = nil end
     processNetwork(now)
-    if cfg.main.enabled then
-      processCapture(now)
-      if sampIsLocalPlayerSpawned() then updateSpeakers(now) end
-    end
+    processCapture(now)
+    if cfg.main.enabled and sampIsLocalPlayerSpawned() then updateSpeakers(now) end
     render(now)
+    if dirtyAt and now - dirtyAt > 1 then dirtyAt = nil; save() end
+  end
+end
+
+-- Esc закрывает меню (или отменяет переназначение клавиши), а не открывает паузу.
+function onWindowMessage(m, wparam)
+  if m == 0x0100 and wparam == 0x1B and ui and ui.isOpen() then
+    consumeWindowMessage(true, false)
+    if bindTarget then bindTarget = nil else ui.close() end
   end
 end
 
 function onScriptTerminate(scr)
   if scr ~= thisScript() then return end
   pcall(function()
+    if dirtyAt then save() end
     sendPacket(packBye())
     if bass then
       for id in pairs(speakers) do freeSpeaker(id) end
