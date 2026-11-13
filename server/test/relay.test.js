@@ -55,7 +55,7 @@ test('proximity voice goes only to nearby players, ack carries online count and 
   join(relay, 'b', 2, 10, 0);
   join(relay, 'c', 3, 200, 0);
   const ack = of(sent, P.S_ACK).at(-1).pkt;
-  assert.equal(ack.status, P.ACK_OK); assert.equal(ack.online, 3); assert.equal(ack.latestVersion, '0.4.0');
+  assert.equal(ack.status, P.ACK_OK); assert.equal(ack.online, 3); assert.equal(ack.latestVersion, '0.4.1');
   clear();
   speak(relay, 'a');
   assert.deepEqual(voiceTo(sent), ['b:1/0']);

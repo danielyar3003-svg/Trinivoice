@@ -22,6 +22,7 @@ local function check(cond, what) if not cond then error(what, 3) end end
 local rnd = 1
 local function coin() rnd = (rnd * 1103515245 + 12345) % 2147483648; return rnd % 3 == 0 end
 
+inCallback = false
 local stacks, calls
 local function reset() stacks = { font = 0, var = 0, color = 0, child = 0, window = 0 }; calls = {} end
 reset()
@@ -84,8 +85,14 @@ local impl = {
   Col = enum('Col'), StyleVar = enum('StyleVar'), WindowFlags = enum('WindowFlags'), Cond = enum('Cond'),
   InputTextFlags = enum('InputTextFlags'),
   GetTime = function() return 12.5 end,
-  OnInitialize = function(cb) initCb[#initCb + 1] = cb end,
-  OnFrame = function(cond, cb) frameCb[#frameCb + 1] = { cond = cond, cb = cb } end,
+  -- mimgui можно трогать только внутри этих колбэков: контекст ImGui общий для
+  -- всех скриптов, вне кадра он чужой или пустой (в игре это падение скрипта)
+  OnInitialize = function(cb)
+    initCb[#initCb + 1] = function(...) inCallback = true; cb(...); inCallback = false end
+  end,
+  OnFrame = function(cond, cb)
+    frameCb[#frameCb + 1] = { cond = cond, cb = function(...) inCallback = true; cb(...); inCallback = false end }
+  end,
   StrCopy = function(dst, src) ffi.copy(dst, src) end,
   GetIO = function() return io end,
   GetStyle = function() return style end,
@@ -125,8 +132,12 @@ local impl = {
 }
 local EXTRA = { ImVec2 = 1, ImVec4 = 1, ImFontConfig = 1, new = 1, Col = 1, StyleVar = 1, WindowFlags = 1, Cond = 1, InputTextFlags = 1,
   OnInitialize = 1, OnFrame = 1, StrCopy = 1 }
+-- не требуют контекста ImGui: типы, перечисления, регистрация колбэков, копирование строк
+local PURE = { ImVec2 = 1, ImVec4 = 1, ImFontConfig = 1, new = 1, Col = 1, StyleVar = 1, WindowFlags = 1, Cond = 1,
+  InputTextFlags = 1, OnInitialize = 1, OnFrame = 1, StrCopy = 1 }
 local imguiMock = setmetatable({}, { __index = function(_, k)
   check(EXTRA[k] or valid['ig' .. k], 'imgui.' .. k .. ' does not exist in mimgui 1.7.1')
+  check(PURE[k] or inCallback, 'imgui.' .. k .. ' called outside OnFrame/OnInitialize (crashes in game)')
   return impl[k] or error('mock missing imgui.' .. k)
 end })
 for k in pairs(impl) do
@@ -307,6 +318,26 @@ test('report flow reaches ctx.report', function()
   local reported = false
   for _, l in ipairs(log) do if l == 'report' then reported = true end end
   assert(reported, 'random clicks never completed a report')
+end)
+
+test('script-side API never touches mimgui outside a frame', function()
+  local ui = loadUi(true)
+  local ctx = makeCtx(PLAYERS)
+  ui.init(ctx)
+  initCb[1]()
+  -- так их вызывает trinivoice.lua из основного цикла, каждый кадр игры
+  for _ = 1, 3 do
+    ui.open(); assert(ui.isOpen())
+    assert(ui.wantsText() == false)
+    reset(); frameCb[1].cb({})
+    assert(type(ui.wantsText()) == 'boolean')
+    ui.hasIcons()
+    -- кадр мог «нажать» крестик (клики в заглушке случайные), поэтому проверяем переключение
+    local before = ui.isOpen()
+    ui.toggle(); assert(ui.isOpen() ~= before)
+    ui.close(); assert(not ui.isOpen())
+    assert(ui.wantsText() == false)
+  end
 end)
 
 print(('%d passed, %d failed'):format(passed, failed))

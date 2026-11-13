@@ -29,6 +29,7 @@ local portBuf = imgui.new.char[8]()
 local freqBuf = imgui.new.char[12]()
 local passBuf = imgui.new.char[64]()
 local reportTarget -- { id, nick }, пока выбирается причина жалобы
+local typing = false -- игрок печатает в поле меню (обновляется в кадре)
 local meter = { bars = {}, t = 0 }
 for i = 1, 14 do meter.bars[i] = 0 end
 
@@ -936,7 +937,11 @@ function M.init(c)
     if not ok then print('[TriniVoice] шрифты не загружены: ' .. tostring(err)) end
   end)
   imgui.OnFrame(function() return show[0] and not isPauseMenuActive() end, function(self)
-    self.LockPlayer = imgui.GetIO().WantTextInput
+    -- Обращаться к mimgui можно ТОЛЬКО здесь, во время кадра: контекст ImGui общий
+    -- для всех скриптов, и вне кадра он может принадлежать другому скрипту или
+    -- отсутствовать. Поэтому флаг ввода запоминаем для основного цикла.
+    typing = imgui.GetIO().WantTextInput
+    self.LockPlayer = typing
     drawWindow()
   end)
 end
@@ -950,11 +955,12 @@ function M.open()
   reportTarget = nil
   show[0] = true
 end
-function M.close() show[0] = false end
+function M.close() show[0] = false; typing = false end
 function M.toggle() if show[0] then M.close() else M.open() end end
 function M.isOpen() return show[0] end
 function M.hasIcons() return iconsReady end
--- true, пока игрок печатает в поле меню: клавиша разговора не должна срабатывать
-function M.wantsText() return show[0] and imgui.GetIO().WantTextInput end
+-- true, пока игрок печатает в поле меню: клавиша разговора не должна срабатывать.
+-- Вызывается из основного цикла скрипта, поэтому mimgui здесь не трогаем.
+function M.wantsText() return show[0] and typing end
 
 return M

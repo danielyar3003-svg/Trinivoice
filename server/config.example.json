@@ -10,7 +10,7 @@
   "admins": [
     { "name": "Admin", "key": "замените-на-длинный-случайный-ключ" }
   ],
-  "latestClientVersion": "0.4.0",
+  "latestClientVersion": "0.4.1",
   "minClientVersion": "0.4.0",
   "adminIps": [],
   "maxClients": 2000,

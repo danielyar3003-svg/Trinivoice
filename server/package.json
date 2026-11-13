@@ -1,6 +1,6 @@
 {
   "name": "trinivoice-relay",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "UDP relay for TriniVoice proximity voice chat (SA-MP, MoonLoader client)",
   "type": "module",
   "main": "src/index.js",
