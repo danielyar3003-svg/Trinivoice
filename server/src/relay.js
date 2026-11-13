@@ -16,7 +16,7 @@ export const DEFAULT_CONFIG = {
   reportCooldownMs: 30000,
   // администраторы ретранслятора: [{ "name": "Admin", "key": "длинный-секрет" }]
   admins: [],
-  latestClientVersion: '0.4.1',
+  latestClientVersion: '0.5.0',
   minClientVersion: '0.4.0',
   // защита от перегрузки
   maxClients: 2000,
@@ -25,6 +25,8 @@ export const DEFAULT_CONFIG = {
   adminIps: [],
   adminMaxFailures: 5,
   adminLockMs: 15 * 60000,
+  // как часто клиент может запрашивать список игроков (каждый вид отдельно)
+  listCooldownMs: 1500,
 };
 
 /**
@@ -87,6 +89,7 @@ export class Relay {
       case P.C_CALL: return this.#onCall(client, pkt);
       case P.C_REPORT: return this.#onReport(client, pkt);
       case P.C_ADMIN: return this.#onAdmin(client, address, port, pkt);
+      case P.C_LIST: return this.#onList(client, pkt);
     }
   }
 
@@ -120,13 +123,13 @@ export class Relay {
       if (this.clients.size >= this.config.maxClients || (this.perIp.get(address) ?? 0) >= this.config.maxClientsPerIp) {
         return this.#ack(address, port, P.ACK_FULL);
       }
-      client = { key, address, port, bucket: this.config.maxVoicePacketsPerSec, bucketAt: t, call: null, reportAt: -Infinity };
+      client = { key, address, port, bucket: this.config.maxVoicePacketsPerSec, bucketAt: t, call: null, reportAt: -Infinity, listAt: {} };
       this.clients.set(key, client);
       this.perIp.set(address, (this.perIp.get(address) ?? 0) + 1);
       this.log(`join ${p.nick}[${p.playerId}] ${address} room=${p.room} v${p.version}`);
     }
     Object.assign(client, {
-      room: p.room, playerId: p.playerId, nick: p.nick, version: p.version,
+      room: p.room, playerId: p.playerId, nick: p.nick, version: p.version, dnd: (p.flags & P.FLAG_DND) !== 0,
       x: p.x, y: p.y, z: p.z, interior: p.interior, seenAt: t,
     });
     this.#setRadio(client, p.radioFreq, p.radioPass);
@@ -225,6 +228,7 @@ export class Relay {
     if (p.action === P.CALL_INVITE) {
       const target = this.rooms.get(client.room)?.get(p.target);
       if (!target || target === client) return this.#to(client, P.encodeCall(P.EV_UNAVAILABLE, p.target, ''));
+      if (target.dnd) return this.#to(client, P.encodeCall(P.EV_DND, target.playerId, target.nick));
       if (target.call || client.call) return this.#to(client, P.encodeCall(P.EV_BUSY, p.target, target.nick));
       const t = this.now();
       client.call = { peer: target, state: 'out', since: t };
@@ -244,6 +248,28 @@ export class Relay {
       this.#endCall(client);
       if (peer) this.#to(client, P.encodeCall(P.EV_ENDED, peer.playerId, peer.nick));
     }
+  }
+
+  // ---------------------------------------------------------------- lists
+
+  #onList(client, p) {
+    if (p.kind !== P.LIST_ROOM && p.kind !== P.LIST_RADIO) return;
+    const t = this.now();
+    if (t - (client.listAt[p.kind] ?? -Infinity) < this.config.listCooldownMs) return;
+    client.listAt[p.kind] = t;
+    const members = this.rooms.get(client.room);
+    let list = members ? [...members.values()] : [];
+    if (p.kind === P.LIST_RADIO) {
+      // список частоты видит только тот, кто сам на ней (с паролем, если он нужен)
+      list = client.radioFreq ? list.filter((o) => o.radioFreq === client.radioFreq) : [];
+    }
+    const entries = list
+      .map((o) => ({
+        id: o.playerId, nick: o.nick,
+        flags: (o.dnd ? P.FLAG_DND : 0) | (o.call?.state === 'active' ? P.FLAG_IN_CALL : 0),
+      }))
+      .sort((a, b) => a.nick.localeCompare(b.nick));
+    for (const pkt of P.encodeList(p.kind, entries)) this.#to(client, pkt);
   }
 
   // ---------------------------------------------------------------- reports & admin

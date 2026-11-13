@@ -8,13 +8,14 @@
 --   audio.lua     кодеки, эффекты (рация, телефон, мегафон, стены), служебные звуки, WAV
 --   ui.lua        меню /tv на mimgui (необязательно)
 
-local SCRIPT_VERSION = '0.4.1'
+local SCRIPT_VERSION = '0.5.0'
 script_name('TriniVoice')
 script_author('TriniVoice')
 script_version(SCRIPT_VERSION)
 script_description('Voice chat for SA-MP via external relay: proximity, radio, phone')
 
 local ffi = require 'ffi'
+local bit = require 'bit'
 local P = require 'trinivoice.protocol'
 local A = require 'trinivoice.audio'
 local inicfg = require 'inicfg'
@@ -88,6 +89,7 @@ local DEFAULTS = {
     phone_start = '',
     phone_end = '',
     admin_key = '',
+    dnd = false,             -- не принимать звонки
   },
   muted = {},
   volume = {},
@@ -175,7 +177,38 @@ local function initBass()
   return true
 end
 
+-- Свои звуки: WAV-файлы в moonloader/resource/trinivoice/sounds/.
+-- Читаются один раз; если файла нет или он не подходит — играет встроенный звук.
+local SOUND_FILES = {
+  click = { 'click.wav', 2 },        -- нажатие клавиши разговора
+  sqOpen = { 'radio_on.wav', 2 },    -- рация: начало фразы
+  sqClose = { 'radio_off.wav', 2 },  -- рация: конец фразы
+  ring = { 'ring.wav', 6 },          -- входящий звонок
+  ringback = { 'ringback.wav', 6 },  -- гудки, когда звоните вы
+}
+local MAX_SOUND_BYTES = 1536 * 1024
+local customSounds
+
+local function loadCustomSounds()
+  customSounds = {}
+  local dir = getWorkingDirectory() .. '\\resource\\trinivoice\\sounds\\'
+  for name, f in pairs(SOUND_FILES) do
+    local path = dir .. f[1]
+    if doesFileExist(path) then
+      local fh = io.open(path, 'rb')
+      local data = fh and fh:read(MAX_SOUND_BYTES + 1)
+      if fh then fh:close() end
+      local w, err
+      if data and #data > MAX_SOUND_BYTES then err = 'файл больше 1.5 МБ'
+      else w, err = A.parseWav(data, f[2]) end
+      if w then customSounds[name] = w
+      else msg(('звук %s: %s, играет стандартный'):format(f[1], tostring(err))) end
+    end
+  end
+end
+
 local function soundsFor(rate)
+  if not customSounds then loadCustomSounds() end
   if not sounds[rate] then
     local s = {}
     s.click = { A.genClick(rate) }
@@ -183,6 +216,7 @@ local function soundsFor(rate)
     s.sqClose = { A.genSquelch(rate, 160, 0.8) }
     s.ring = { A.genTones(rate, A.RINGTONE, 7000) }
     s.ringback = { A.genTones(rate, A.RINGBACK, 5000) }
+    for name, w in pairs(customSounds) do s[name] = { A.resample(w.buf, w.n, w.rate, rate) } end
     sounds[rate] = s
   end
   return sounds[rate]
@@ -422,6 +456,9 @@ local function putFrame(sp, pcm, n)
   else
     A.muffle(pcm, n, rate, sp.cutoff, sp.fx)
   end
+  -- громче 100%: усиливаем сам звук (громкость канала BASS выше 1 не поднимается)
+  local personal = (tonumber(cfg.volume[sp.nick]) or 100) / 100
+  if personal > 1 then A.applyGain(pcm, n, personal) end
   bass.BASS_StreamPutData(sp.stream, pcm, n * 2)
 end
 
@@ -509,7 +546,7 @@ local function updateSpeakers(now)
   local px, py = getActiveCameraPointAt()
   local master = cfg.main.master_volume / 100
   for id, sp in pairs(speakers) do
-    local personal = (tonumber(cfg.volume[sp.nick]) or 100) / 100
+    local personal = math.min(1, (tonumber(cfg.volume[sp.nick]) or 100) / 100) -- выше 1 — в putFrame
     if sp.route == P.ROUTE_RADIO and not sp.closed and now - sp.last > 0.25 then
       sp.closed = true
       if cfg.main.fx_radio then
@@ -585,6 +622,8 @@ local function onCall(p, now)
   elseif p.event == P.EV_UNAVAILABLE then
     msg('абонент недоступен: нет TriniVoice рядом с сервером или не ответил')
     if call and call.state == 'out' then call = nil end
+  elseif p.event == P.EV_DND then
+    msg(who .. ' не принимает звонки')
   elseif p.event == P.EV_BUSY then
     -- при автозвонке оба набирают друг друга одновременно: «занято» тут ожидаемо
     local auto = autoCall[p.peerNick:lower()]
@@ -595,8 +634,10 @@ end
 
 local function processRinging(now)
   if not call or call.state == 'active' or now < nextRing then return end
-  nextRing = now + 2
-  playLocal(call.state == 'in' and 'ring' or 'ringback', cfg.main.ring_volume / 100)
+  local name = call.state == 'in' and 'ring' or 'ringback'
+  local snd = soundsFor(LOCAL_RATE)[name]
+  nextRing = now + math.max(2, snd[2] / LOCAL_RATE + 0.4)
+  playLocal(name, cfg.main.ring_volume / 100)
 end
 
 -- Автозвонки: сервер пишет в чат о звонке, мы сами соединяем голос.
@@ -685,6 +726,50 @@ local function onAck(p, now)
   end
 end
 
+---------------------------------------------------------------------------
+-- Списки игроков (все на сервере / на моей частоте)
+---------------------------------------------------------------------------
+
+local lists = { [P.LIST_ROOM] = { entries = {}, at = -100 }, [P.LIST_RADIO] = { entries = {}, at = -100 } }
+local listBuild, listPrint = {}, {}
+
+local function requestList(kind)
+  listBuild[kind] = nil
+  sendPacket(P.packListRequest(kind))
+end
+
+local function printList(kind)
+  local l = lists[kind].entries
+  msg(kind == P.LIST_ROOM and ('с TriniVoice на сервере: %d'):format(#l) or ('на частоте %s: %d'):format(P.freqLabel(radioWire()), #l))
+  local line = ''
+  for _, e in ipairs(l) do
+    local item = ('%s [%d]'):format(e.nick, e.id)
+    if bit.band(e.flags, P.FLAG_DND) ~= 0 then item = item .. ' (без звонков)'
+    elseif bit.band(e.flags, P.FLAG_IN_CALL) ~= 0 then item = item .. ' (разговаривает)' end
+    if #line + #item > 100 then msg(line); line = '' end
+    line = line == '' and item or (line .. ', ' .. item)
+  end
+  if line ~= '' then msg(line) end
+end
+
+local function onList(p, now)
+  if not lists[p.kind] or p.pages < 1 then return end
+  local b = listBuild[p.kind]
+  if not b or b.pages ~= p.pages then b = { pages = p.pages, parts = {}, got = 0 }; listBuild[p.kind] = b end
+  if not b.parts[p.page] then
+    for _, e in ipairs(p.entries) do e.nick = P.cleanNick(e.nick) end
+    b.parts[p.page] = p.entries
+    b.got = b.got + 1
+  end
+  if b.got >= b.pages then
+    local all = {}
+    for i = 0, b.pages - 1 do for _, e in ipairs(b.parts[i] or {}) do all[#all + 1] = e end end
+    lists[p.kind] = { entries = all, at = now }
+    listBuild[p.kind] = nil
+    if listPrint[p.kind] then listPrint[p.kind] = nil; printList(p.kind) end
+  end
+end
+
 local function processNetwork(now)
   if not udp then return end
   for _ = 1, 300 do
@@ -696,6 +781,7 @@ local function processNetwork(now)
       elseif p.type == P.S_VOICE then if cfg.main.enabled then onVoice(p, now) end
       elseif p.type == P.S_CALL then onCall(p, now)
       elseif p.type == P.S_NOTICE then msg(P.cleanText(p.text))
+      elseif p.type == P.S_LIST then onList(p, now)
       elseif p.type == P.S_TOKEN then
         P.setToken(p.token)
         net.lastState = 0 -- сразу повторить STATE уже с токеном
@@ -714,6 +800,7 @@ local function processNetwork(now)
         id = id, x = x, y = y, z = z, interior = getActiveInterior(), room = net.room,
         nick = sampGetPlayerNickname(id), version = SCRIPT_VERSION,
         radioFreq = radioWire(), radioPass = tostring(cfg.main.radio_pass or ''),
+        flags = cfg.main.dnd and P.FLAG_DND or 0,
       }))
       net.stateAt = net.stateAt or now
     end
@@ -751,7 +838,8 @@ local function render(now)
   elseif tx.active then state, color = 'В ЭФИРЕ' .. (tx.mode and tx.mode > 3 and (' (' .. MODE_NAME[tx.mode] .. ')') or ''), 0xFFFF5050
   elseif cfg.main.activation == 'vad' then state, color = 'голосовая активация', 0xFFE0E0E0
   else state, color = ('%s - говорить'):format(keyName(cfg.main.ptt_key)), 0xFFE0E0E0 end
-  lines[#lines + 1] = { ('TriniVoice | %s | %s'):format(MODE_NAME[cfg.main.mode], state), color }
+  lines[#lines + 1] = { ('TriniVoice | %s | %s%s'):format(MODE_NAME[cfg.main.mode], state,
+    cfg.main.dnd and ' | звонки выкл' or ''), color }
   if radioWire() > 0 then
     lines[#lines + 1] = { ('Рация %s | %s - говорить | на частоте: %d'):format(
       P.freqLabel(radioWire()), keyName(cfg.main.radio_key), net.radioListeners), 0xFF9DB2FF }
@@ -889,6 +977,13 @@ local uiContext = {
   binding = function() return bindTarget end,
   startBinding = function(which) bindTarget = which end,
   keyName = keyName,
+  lists = function(kind) return lists[kind] end,
+  requestList = requestList,
+  myId = function()
+    local ok, id = sampGetPlayerIdByCharHandle(PLAYER_PED)
+    return ok and id or -1
+  end,
+  setDnd = function(on) cfg.main.dnd = on; net.lastState = 0; markDirty() end,
 }
 
 ---------------------------------------------------------------------------
@@ -901,7 +996,9 @@ local HELP = {
   '/tv mode 1-3 - шёпот, обычный, крик; /tv ptt | vad - клавиша или голос',
   '/tv radio on | off | ЧАСТОТА - рация (например /tv radio 911.0), /tv radiopass ПАРОЛЬ',
   '/tv call ID - позвонить, /tv accept - ответить, /tv decline | hangup - сбросить',
-  '/tv mute ID | unmute ID, /tv vol ID 0-100, /tv master 0-100, /tv gain 50-400',
+  '/tv mute ID | unmute ID, /tv vol ID 0-200, /tv master 0-100, /tv gain 50-400',
+  '/tv players - все с TriniVoice на сервере, /tv freqlist - кто на моей частоте',
+  '/tv dnd on | off - не принимать звонки / снова принимать',
   '/tv report ID причина - жалоба (сохраняет запись голоса)',
   '/tv codec ulaw | opus, /tv icons, /tv hud, /tv server HOST PORT',
   '/tv autocall on | off, /tv autocall start|end ШАБЛОН - звонки по сообщениям сервера',
@@ -940,6 +1037,14 @@ local function onCommand(args)
     msg(m.radio_on and ('рация включена, частота ' .. P.freqLabel(radioWire()) .. ', клавиша ' .. keyName(m.radio_key)) or 'рация выключена')
   elseif c == 'radiopass' then
     m.radio_pass = a[2] and A.u8(a[2]) or ''; msg(a[2] and 'пароль частоты задан' or 'пароль частоты сброшен')
+  elseif c == 'players' then
+    listPrint[P.LIST_ROOM] = true; requestList(P.LIST_ROOM); return
+  elseif c == 'freqlist' then
+    if radioWire() == 0 then msg('рация выключена: /tv radio ЧАСТОТА'); return end
+    listPrint[P.LIST_RADIO] = true; requestList(P.LIST_RADIO); return
+  elseif c == 'dnd' and (a[2] == 'on' or a[2] == 'off') then
+    m.dnd = a[2] == 'on'; net.lastState = 0
+    msg(m.dnd and 'звонки выключены: до вас никто не дозвонится' or 'звонки снова включены')
   elseif c == 'call' and tonumber(a[2]) then
     callPlayer(tonumber(a[2])); return
   elseif c == 'accept' then
@@ -954,7 +1059,7 @@ local function onCommand(args)
     msg((c == 'mute' and 'звук выключен: ' or 'звук включён: ') .. nick)
   elseif c == 'vol' and tonumber(a[3]) then
     local nick = nickById(a[2]); if not nick then return end
-    cfg.volume[nick] = clamp(math.floor(tonumber(a[3])), 0, 100)
+    cfg.volume[nick] = clamp(math.floor(tonumber(a[3])), 0, 200)
     msg(('громкость %s: %d%%'):format(nick, cfg.volume[nick]))
   elseif c == 'master' and tonumber(a[2]) then
     m.master_volume = clamp(math.floor(tonumber(a[2])), 0, 100); msg('общая громкость: ' .. m.master_volume .. '%')

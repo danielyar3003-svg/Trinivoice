@@ -52,7 +52,7 @@ test('state packet layout', function()
   eq(s:sub(33, 44), '\11' .. 'Ivan_Ivanov')
   eq(s:sub(45, 50), '\5' .. '0.3.0')
   eq(s:byte(51) + s:byte(52) * 256, 9115)
-  eq(s:sub(53), '\2pw')
+  eq(s:sub(53), '\2pw\0', 'password, then flags')
 end)
 
 test('client packets carry the session token', function()
@@ -187,6 +187,64 @@ test('wav header', function()
   eq(w:sub(1, 4), 'RIFF'); eq(w:sub(9, 16), 'WAVEfmt ')
   local function le32(s, i) local a, b, c, d = s:byte(i, i + 3); return a + b * 256 + c * 65536 + d * 16777216 end
   eq(le32(w, 25), 8000); eq(le32(w, 41), 1600); eq(le32(w, 5), 36 + 1600)
+end)
+
+test('state flags, list request and list reply', function()
+  P.setToken(Z8)
+  local st = P.packState({ id = 1, x = 0, y = 0, z = 0, room = 'r', nick = 'n', version = '0.5.0', flags = P.FLAG_DND })
+  eq(st:byte(#st), P.FLAG_DND, 'flags byte at the end')
+  eq(P.packListRequest(P.LIST_RADIO), 'TV\3\7' .. Z8 .. '\2')
+  local l = P.parseServer('TV\3\134' .. '\1' .. '\0' .. '\2' .. '\45\0' .. '\2' ..
+    '\7\0' .. '\3Bob' .. '\1' .. '\8\1' .. '\5Alice' .. '\2')
+  eq(l.type, P.S_LIST); eq(l.kind, 1); eq(l.page, 0); eq(l.pages, 2); eq(l.total, 45); eq(#l.entries, 2)
+  eq(l.entries[1].nick, 'Bob'); eq(l.entries[1].flags, P.FLAG_DND); eq(l.entries[2].id, 264)
+  eq(P.parseServer('TV\3\134\1\0\1\1\0\1\7\0'), nil, 'truncated entry')
+end)
+
+test('gain above 100% amplifies and never clips harshly', function()
+  local b = ffi.new('int16_t[4]', { 1000, -1000, 20000, -30000 })
+  A.applyGain(b, 4, 2)
+  eq(b[0], 2000); eq(b[1], -2000)
+  assert(b[2] > 26000 and b[2] <= 32767, 'soft knee ' .. b[2])
+  assert(b[3] < -26000 and b[3] >= -32767, 'soft knee ' .. b[3])
+  local c = ffi.new('int16_t[1]', { 1234 }); A.applyGain(c, 1, 1); eq(c[0], 1234)
+end)
+
+local function makeWav(rate, channels, bits, frames, fn)
+  local function le(n, k) local t = {} for _ = 1, k do t[#t + 1] = string.char(n % 256); n = math.floor(n / 256) end return table.concat(t) end
+  local body = {}
+  for i = 0, frames - 1 do
+    for ch = 1, channels do
+      local v = fn(i, ch)
+      if bits == 16 then body[#body + 1] = le(v < 0 and v + 65536 or v, 2) else body[#body + 1] = string.char(v) end
+    end
+  end
+  local data = table.concat(body)
+  local fmt = le(1, 2) .. le(channels, 2) .. le(rate, 4) .. le(rate * channels * bits / 8, 4) .. le(channels * bits / 8, 2) .. le(bits, 2)
+  return 'RIFF' .. le(4 + 8 + #fmt + 8 + #data + 8 + 4, 4) .. 'WAVE' ..
+    'LIST' .. le(4, 4) .. 'INFO' .. -- лишний чанк, его надо пропустить
+    'fmt ' .. le(#fmt, 4) .. fmt .. 'data' .. le(#data, 4) .. data
+end
+
+test('custom WAV: 16-bit stereo, 8-bit mono, limits and bad files', function()
+  local w = assert(A.parseWav(makeWav(44100, 2, 16, 441, function(i, ch) return ch == 1 and 1000 or -3000 end), 2))
+  eq(w.rate, 44100); eq(w.n, 441); eq(w.buf[0], -1000, 'stereo averaged to mono')
+  local m = assert(A.parseWav(makeWav(8000, 1, 8, 10, function() return 200 end)))
+  eq(m.buf[5], (200 - 128) * 256)
+  local long = makeWav(8000, 1, 16, 8000 * 3, function() return 0 end)
+  local ok, err = A.parseWav(long, 2); eq(ok, nil); assert(err:find('длинн'), err)
+  eq((A.parseWav('hello world, not a wav at all.......................')), nil)
+  local mp3ish = makeWav(8000, 1, 16, 10, function() return 0 end):gsub('fmt (....)\1\0', 'fmt %1\85\0')
+  eq((A.parseWav(mp3ish)), nil, 'compressed format rejected')
+end)
+
+test('resample keeps duration and shape', function()
+  local src = ffi.new('int16_t[441]')
+  for i = 0, 440 do src[i] = math.floor(math.sin(2 * math.pi * 441 * i / 44100) * 10000) end
+  local out, n = A.resample(src, 441, 44100, 16000)
+  eq(n, 160)
+  assert(math.abs(out[40] - math.floor(math.sin(2 * math.pi * 441 * 40 / 16000) * 10000)) < 400)
+  local same, sn = A.resample(src, 441, 8000, 8000); eq(sn, 441); eq(same[100], src[100])
 end)
 
 print(('%d passed, %d failed'):format(passed, failed))

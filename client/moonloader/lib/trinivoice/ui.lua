@@ -276,7 +276,7 @@ local function sectionTitle(x, y, s) text(x, y, s, C.white, fonts.bold) end
 
 local PAGES = {
   { 'HOUSE', 'Главная' },
-  { 'USERS', 'Игроки рядом' },
+  { 'USERS', 'Игроки' },
   { 'SLIDERS', 'Звук' },
   { 'WALKIE_TALKIE', 'Рация' },
   { 'SERVER', 'Сервер' },
@@ -488,8 +488,135 @@ local function pageHome(st)
   if nv then ctx.set('master_volume', nv) end
 end
 
+-- Списки с ретранслятора: 1 — все на SA-MP сервере, 2 — все на моей частоте.
+local LIST_ROOM, LIST_RADIO = 1, 2
+local FLAG_DND, FLAG_IN_CALL = 1, 2
+local playersTab = 1
+local listAskedAt = { [LIST_ROOM] = -100, [LIST_RADIO] = -100 }
+
+-- Пока список виден на экране, обновляем его раз в 3 секунды
+-- (ретранслятор всё равно отвечает не чаще раза в 1.5 сек).
+local function keepListFresh(kind)
+  local t = os.clock()
+  if t - listAskedAt[kind] >= 3 then
+    listAskedAt[kind] = t
+    ctx.requestList(kind)
+  end
+end
+
+local function emptyState(cy, ico, title, sub)
+  ico = icon(ico)
+  if ico ~= '' then
+    local sz = textSize(ico, fonts.icon)
+    text(X0 + (CW - sz.x) / 2, cy, ico, C.muted, fonts.icon)
+  end
+  local s1 = textSize(title, fonts.bold)
+  text(X0 + (CW - s1.x) / 2, cy + 40, title, C.white, fonts.bold)
+  local s2 = textSize(sub)
+  text(X0 + (CW - s2.x) / 2, cy + 64, sub, C.muted)
+end
+
+-- Прокручиваемая область под списком: fn(y) рисует строки, возвращает высоту.
+local function scrollArea(id, x, y, w, h, rows, rowH, drawRow)
+  imgui.SetCursorPos(V(x, y))
+  imgui.PushStyleColor(imgui.Col.ChildBg, imgui.ImVec4(0, 0, 0, 0))
+  imgui.BeginChild(id, V(w, h), false, 0)
+  local saveDl, saveOrg = dl, org
+  dl = imgui.GetWindowDrawList()
+  org = imgui.GetWindowPos() - V(0, imgui.GetScrollY())
+  for i, row in ipairs(rows) do drawRow(row, (i - 1) * rowH) end
+  imgui.SetCursorPos(V(0, #rows * rowH))
+  imgui.Dummy(V(1, 1))
+  dl, org = saveDl, saveOrg
+  imgui.EndChild()
+  imgui.PopStyleColor(1)
+end
+
+local function drawNearbyRow(p, y)
+  local ring = p.talking and (p.mode == 3 and C.orange or (p.mode == 1 and C.whisper or C.green)) or nil
+  rect(0, y, CW, 60, C.card, 12)
+  frame(0, y, CW, 60, ring and mix(C.border, ring, 0.45) or C.border, 12)
+  avatar(14, y + 10, p.nick, ring)
+  text(68, y + 12, p.nick, p.muted and C.soft2 or C.white, fonts.bold)
+  local nw = textSize(p.nick, fonts.bold).x
+  text(68 + nw + 6, y + 12, '[' .. p.id .. ']', C.muted)
+  local status, scol
+  if p.muted then status, scol = 'заглушён', C.redText
+  elseif p.talking then status, scol = 'говорит · ' .. MODE_LABEL[p.mode or 2], p.mode == 3 and C.orangeText or C.greenText
+  else status, scol = 'молчит', C.muted end
+  text(68, y + 32, status, scol, fonts.small)
+
+  local dist = ('%.1f м'):format(p.dist)
+  local dsz = textSize(dist, fonts.small)
+  rect(262, y + 19, 64, 22, C.key, 8)
+  text(262 + (64 - dsz.x) / 2, y + 19 + (22 - dsz.y) / 2, dist, C.soft, fonts.small)
+
+  -- громкость 0–200%: середина ползунка = 100%
+  local sx, sw = 262 + 64 + 16, CW - (262 + 64 + 16) - 190
+  local vol = p.muted and 0 or p.volume
+  if p.muted then
+    rect(sx, y + 27, sw, 6, hex('22242C'), 3)
+  else
+    rect(sx + sw / 2 - 1, y + 21, 2, 18, C.border2, 1)
+    local nv = slider('##vol' .. p.nick, sx, y + 27, sw, p.volume, 0, 200)
+    if nv then ctx.setVolume(p.nick, nv) end
+  end
+  local vs = vol .. '%'
+  local vsz = textSize(vs, fonts.bold)
+  text(CW - 140 - vsz.x, y + 30 - vsz.y / 2, vs, p.muted and C.muted or (vol > 100 and C.orangeText or C.white), fonts.bold)
+  local inCall = ctx.call() ~= nil
+  local pico = icon('PHONE')
+  if pico == '' then pico = 'тел' end
+  if iconButton('##call' .. p.nick, CW - 128, y + 13, 34, pico, inCall and C.muted or C.soft, C.key) and not inCall then
+    ctx.callPlayer(p.id)
+  end
+  local fico = icon('FLAG')
+  if fico == '' then fico = '!' end
+  if iconButton('##report' .. p.nick, CW - 88, y + 13, 34, fico, C.soft, C.key) then
+    reportTarget = { id = p.id, nick = p.nick }
+  end
+  local ico = p.muted and icon('VOLUME_XMARK') or icon('VOLUME_HIGH')
+  if ico == '' then ico = p.muted and 'вкл' or 'выкл' end
+  if iconButton('##mute' .. p.nick, CW - 48, y + 13, 34, ico, p.muted and C.redText or C.soft,
+      p.muted and alpha(C.red, 0.16) or C.key) then
+    ctx.toggleMute(p.nick)
+  end
+end
+
+local function drawServerRow(e, y)
+  local me = e.id == ctx.myId()
+  local dnd = bit.band(e.flags, FLAG_DND) ~= 0
+  local busy = bit.band(e.flags, FLAG_IN_CALL) ~= 0
+  rect(0, y, CW, 60, C.card, 12)
+  frame(0, y, CW, 60, C.border, 12)
+  avatar(14, y + 10, e.nick, nil)
+  text(68, y + 12, e.nick, C.white, fonts.bold)
+  local nw = textSize(e.nick, fonts.bold).x
+  text(68 + nw + 6, y + 12, '[' .. e.id .. ']' .. (me and ' · это вы' or ''), C.muted)
+  local status, scol
+  if dnd then status, scol = 'не принимает звонки', C.redText
+  elseif busy then status, scol = 'разговаривает', C.orangeText
+  else status, scol = 'можно позвонить', C.muted end
+  text(68, y + 32, status, scol, fonts.small)
+
+  local inCall = ctx.call() ~= nil
+  local bx, bw = CW - 16 - 150, 150
+  if not me and not dnd and not busy and not inCall then
+    local ph = icon('PHONE')
+    if button('##srvcall' .. e.id, bx, y + 13, bw, 34, (ph ~= '' and (ph .. '  ') or '') .. 'Позвонить', true) then
+      ctx.callPlayer(e.id)
+    end
+  else
+    local why = me and 'Это вы' or (dnd and 'Без звонков' or (busy and 'Занят' or 'Вы в звонке'))
+    rect(bx, y + 13, bw, 34, C.key, 9)
+    local sz = textSize(why, fonts.bold)
+    text(bx + (bw - sz.x) / 2, y + 13 + (34 - sz.y) / 2, why, C.muted, fonts.bold)
+  end
+end
+
 local function pagePlayers(st)
-  header('Игроки рядом', 'Настройки запоминаются по нику')
+  header('Игроки', playersTab == 1 and 'Кого вы слышали рядом'
+    or 'Все с TriniVoice на этом сервере SA-MP')
   -- поиск
   imgui.SetCursorPos(V(W - 26 - 32 - 12 - 200, 24))
   imgui.SetNextItemWidth(200)
@@ -498,6 +625,7 @@ local function pagePlayers(st)
   imgui.InputTextWithHint('##search', icon('MAGNIFYING_GLASS') .. '  Ник или ID', searchBuf, ffi.sizeof(searchBuf))
   imgui.PopStyleVar(2)
   local query = ffi.string(searchBuf):lower()
+  local function match(nick, id) return query == '' or nick:lower():find(query, 1, true) or tostring(id) == query end
 
   if reportTarget then
     local y = 86
@@ -517,88 +645,38 @@ local function pagePlayers(st)
     return
   end
 
-  local list = {}
-  for _, p in ipairs(ctx.players()) do
-    if query == '' or p.nick:lower():find(query, 1, true) or tostring(p.id) == query then list[#list + 1] = p end
+  -- вкладки и «принимать звонки»
+  local tab = segmented('##ptab', X0, 86, 280, 34, { 'Рядом', 'На сервере' }, playersTab)
+  if tab then playersTab = tab end
+  local m = ctx.cfg.main
+  local lbl = 'Принимать звонки'
+  local lw = textSize(lbl).x
+  textMid(X0 + CW - 46 - 10 - lw, 90, 26, lbl, m.dnd and C.muted or C.soft)
+  if toggle('##acceptCalls', X0 + CW - 46, 90, not m.dnd) then ctx.setDnd(not m.dnd) end
+
+  local top, h = 134, 400
+  if playersTab == 1 then
+    local list = {}
+    for _, p in ipairs(ctx.players()) do if match(p.nick, p.id) then list[#list + 1] = p end end
+    if #list == 0 then
+      emptyState(250, 'MICROPHONE_SLASH', query == '' and 'Пока никого не слышно' or 'Никого не найдено',
+        'Здесь появятся игроки с TriniVoice, которых вы слышали рядом')
+      return
+    end
+    scrollArea('##players', X0, top, CW + 8, h, list, 68, drawNearbyRow)
+  else
+    keepListFresh(LIST_ROOM)
+    local data = ctx.lists(LIST_ROOM)
+    local list = {}
+    for _, e in ipairs(data.entries) do if match(e.nick, e.id) then list[#list + 1] = e end end
+    if #list == 0 then
+      local loading = data.at < 0
+      emptyState(250, 'USERS', loading and 'Загружаю список...' or (query == '' and 'Никого нет' or 'Никого не найдено'),
+        loading and 'Список приходит с голосового сервера' or 'На этом сервере пока никто не подключён к TriniVoice')
+      return
+    end
+    scrollArea('##server', X0, top, CW + 8, h, list, 68, drawServerRow)
   end
-
-  if #list == 0 then
-    local cy = 220
-    local ico = icon('MICROPHONE_SLASH')
-    if ico ~= '' then
-      local sz = textSize(ico, fonts.icon)
-      text(X0 + (CW - sz.x) / 2, cy, ico, C.muted, fonts.icon)
-    end
-    local t1 = query == '' and 'Пока никого не слышно' or 'Никого не найдено'
-    local s1 = textSize(t1, fonts.bold)
-    text(X0 + (CW - s1.x) / 2, cy + 40, t1, C.white, fonts.bold)
-    local t2 = 'Здесь появятся игроки с TriniVoice, которых вы слышали рядом'
-    local s2 = textSize(t2)
-    text(X0 + (CW - s2.x) / 2, cy + 64, t2, C.muted)
-    return
-  end
-
-  -- список с прокруткой
-  imgui.SetCursorPos(V(X0, 86))
-  imgui.PushStyleColor(imgui.Col.ChildBg, imgui.ImVec4(0, 0, 0, 0))
-  imgui.BeginChild('##players', V(CW + 8, 404), false, 0)
-  local saveDl, saveOrg = dl, org
-  dl = imgui.GetWindowDrawList()
-  org = imgui.GetWindowPos() - V(0, imgui.GetScrollY())
-  for i, p in ipairs(list) do
-    local y = (i - 1) * 68
-    local ring = p.talking and (p.mode == 3 and C.orange or (p.mode == 1 and C.whisper or C.green)) or nil
-    rect(0, y, CW, 60, C.card, 12)
-    frame(0, y, CW, 60, ring and mix(C.border, ring, 0.45) or C.border, 12)
-    avatar(14, y + 10, p.nick, ring)
-    text(68, y + 12, p.nick, p.muted and C.soft2 or C.white, fonts.bold)
-    local nw = textSize(p.nick, fonts.bold).x
-    text(68 + nw + 6, y + 12, '[' .. p.id .. ']', C.muted)
-    local status, scol
-    if p.muted then status, scol = 'заглушён', C.redText
-    elseif p.talking then status, scol = 'говорит · ' .. MODE_LABEL[p.mode or 2], p.mode == 3 and C.orangeText or C.greenText
-    else status, scol = 'молчит', C.muted end
-    text(68, y + 32, status, scol, fonts.small)
-
-    local dist = ('%.1f м'):format(p.dist)
-    local dsz = textSize(dist, fonts.small)
-    rect(262, y + 19, 64, 22, C.key, 8)
-    text(262 + (64 - dsz.x) / 2, y + 19 + (22 - dsz.y) / 2, dist, C.soft, fonts.small)
-
-    local sx, sw = 262 + 64 + 16, CW - (262 + 64 + 16) - 190
-    local vol = p.muted and 0 or p.volume
-    if p.muted then
-      rect(sx, y + 27, sw, 6, hex('22242C'), 3)
-    else
-      local nv = slider('##vol' .. p.nick, sx, y + 27, sw, p.volume, 0, 100)
-      if nv then ctx.setVolume(p.nick, nv) end
-    end
-    local vs = vol .. '%'
-    local vsz = textSize(vs, fonts.bold)
-    text(CW - 140 - vsz.x, y + 30 - vsz.y / 2, vs, p.muted and C.muted or C.white, fonts.bold)
-    local inCall = ctx.call() ~= nil
-    local pico = icon('PHONE')
-    if pico == '' then pico = 'тел' end
-    if iconButton('##call' .. p.nick, CW - 128, y + 13, 34, pico, inCall and C.muted or C.soft, C.key) and not inCall then
-      ctx.callPlayer(p.id)
-    end
-    local fico = icon('FLAG')
-    if fico == '' then fico = '!' end
-    if iconButton('##report' .. p.nick, CW - 88, y + 13, 34, fico, C.soft, C.key) then
-      reportTarget = { id = p.id, nick = p.nick }
-    end
-    local ico = p.muted and icon('VOLUME_XMARK') or icon('VOLUME_HIGH')
-    if ico == '' then ico = p.muted and 'вкл' or 'выкл' end
-    if iconButton('##mute' .. p.nick, CW - 48, y + 13, 34, ico, p.muted and C.redText or C.soft,
-        p.muted and alpha(C.red, 0.16) or C.key) then
-      ctx.toggleMute(p.nick)
-    end
-  end
-  imgui.SetCursorPos(V(0, #list * 68))
-  imgui.Dummy(V(1, 1))
-  dl, org = saveDl, saveOrg
-  imgui.EndChild()
-  imgui.PopStyleColor(1)
 end
 
 local function pageSound(st)
@@ -749,26 +827,55 @@ local function pageRadio(st)
   local nv = slider('##radioVol', mx + 16, y + 124, hw - 32, m.radio_volume, 0, 100)
   if nv then ctx.set('radio_volume', nv) end
 
-  -- избранные частоты
+  -- избранные частоты и кто на частоте
   y = 404
-  card(X0, y, CW, 100)
+  local hw3 = (CW - 14) / 2
+  card(X0, y, hw3, 136)
   sectionTitle(X0 + 16, y + 14, 'Избранные частоты')
   local presets = ctx.radioPresets()
   if #presets == 0 then
-    text(X0 + 16, y + 44, 'Добавьте в trinivoice.ini раздел [radio_presets], например:', C.muted, fonts.small)
-    text(X0 + 16, y + 64, 'LSPD=911.0    EMS=912.0    Такси=150.5', C.soft, fonts.small)
+    text(X0 + 16, y + 44, 'Добавьте в trinivoice.ini', C.muted, fonts.small)
+    text(X0 + 16, y + 62, 'раздел [radio_presets], например:', C.muted, fonts.small)
+    text(X0 + 16, y + 86, 'LSPD=911.0   EMS=912.0', C.soft, fonts.small)
   else
-    local cx = X0 + 16
+    local cx, cy = X0 + 16, y + 44
     for i, pr in ipairs(presets) do
       local label2 = ('%s  %.1f'):format(pr.name, pr.freq)
       local w = textSize(label2, fonts.bold).x + 24
-      if cx + w > X0 + CW - 16 then break end
+      if cx + w > X0 + hw3 - 16 then cx, cy = X0 + 16, cy + 42 end
+      if cy > y + 86 then break end
       local activeP = on and math.abs((tonumber(m.radio_freq) or 0) - pr.freq) < 0.05
-      if button('##preset' .. i, cx, y + 46, w, 34, label2, activeP) then
+      if button('##preset' .. i, cx, cy, w, 34, label2, activeP) then
         ctx.setRadio(true, pr.freq)
         imgui.StrCopy(freqBuf, ('%.1f'):format(pr.freq))
       end
       cx = cx + w + 8
+    end
+  end
+
+  local lx = X0 + hw3 + 14
+  card(lx, y, hw3, 136)
+  if not on then
+    sectionTitle(lx + 16, y + 14, 'На частоте')
+    text(lx + 16, y + 48, 'Включите рацию, чтобы увидеть,', C.muted, fonts.small)
+    text(lx + 16, y + 66, 'кто сейчас на частоте', C.muted, fonts.small)
+  else
+    keepListFresh(LIST_RADIO)
+    local data = ctx.lists(LIST_RADIO)
+    sectionTitle(lx + 16, y + 14, ('На частоте: %d'):format(#data.entries))
+    if #data.entries == 0 then
+      text(lx + 16, y + 48, data.at < 0 and 'Загружаю...' or 'Пока никого', C.muted, fonts.small)
+    else
+      scrollArea('##freqlist', lx + 12, y + 40, hw3 - 20, 88, data.entries, 22, function(e, ry)
+        local me = e.id == ctx.myId()
+        local dnd = bit.band(e.flags, FLAG_DND) ~= 0
+        dl:AddCircleFilled(org + V(10, ry + 11), 3, u32(me and acc or C.green), 12)
+        text(20, ry + 3, ('%s [%d]%s'):format(e.nick, e.id, me and ' · вы' or ''), me and C.white or C.soft, fonts.small)
+        if dnd then
+          local t = 'без звонков'
+          text(hw3 - 40 - textSize(t, fonts.small).x, ry + 3, t, C.muted, fonts.small)
+        end
+      end)
     end
   end
 end

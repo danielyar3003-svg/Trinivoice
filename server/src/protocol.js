@@ -14,12 +14,22 @@ export const C_BYE = 0x03;
 export const C_CALL = 0x04;
 export const C_REPORT = 0x05;
 export const C_ADMIN = 0x06;
+export const C_LIST = 0x07;   // u8 kind: запросить список игроков
 // relay -> client
 export const S_ACK = 0x81;
 export const S_VOICE = 0x82;
 export const S_CALL = 0x83;
 export const S_NOTICE = 0x84;
 export const S_TOKEN = 0x85;
+export const S_LIST = 0x86;   // страница списка игроков
+
+export const LIST_ROOM = 1;   // все с TriniVoice на этом SA-MP сервере
+export const LIST_RADIO = 2;  // все на моей частоте рации
+export const LIST_PAGE = 40;  // записей в одном пакете (~1.2 КБ)
+
+// флаги записи списка и STATE
+export const FLAG_DND = 1;     // не принимает звонки
+export const FLAG_IN_CALL = 2; // сейчас разговаривает
 
 export const ACK_OK = 0;
 export const ACK_ROOM_NOT_ALLOWED = 1;
@@ -56,6 +66,7 @@ export const EV_ENDED = 3;
 export const EV_UNAVAILABLE = 4;
 export const EV_BUSY = 5;
 export const EV_RINGING = 6;
+export const EV_DND = 7; // абонент не принимает звонки
 
 export const ADMIN_MUTE = 1;
 export const ADMIN_UNMUTE = 2;
@@ -85,6 +96,8 @@ class Reader {
     this.off += len;
     return v;
   }
+  // необязательное поле в конце пакета: у клиентов старых версий его нет
+  optU8(def = 0) { return this.off < this.buf.length ? this.u8() : def; }
 }
 
 const NO_TOKEN = Buffer.alloc(TOKEN_LEN);
@@ -119,7 +132,9 @@ export function decodeClient(buf) {
       p = {
         type, playerId: r.u16(), x: r.f32(), y: r.f32(), z: r.f32(), interior: r.u8(),
         room: r.str(), nick: r.str(), version: r.str(), radioFreq: r.u16(), radioPass: r.str('utf8'),
+        flags: 0,
       };
+      p.flags = r.optU8(0); // с 0.5.0; у 0.4.x нет
       if (![p.x, p.y, p.z].every(Number.isFinite) || !p.room || !p.nick) return null;
       break;
     }
@@ -134,6 +149,7 @@ export function decodeClient(buf) {
     case C_CALL: p = { type, action: r.u8(), target: r.u16() }; break;
     case C_REPORT: p = { type, target: r.u16(), reason: r.str('utf8') }; break;
     case C_ADMIN: p = { type, key: r.str('utf8'), action: r.u8(), nick: r.str(), minutes: r.u32() }; break;
+    case C_LIST: p = { type, kind: r.u8() }; break;
     default: return null;
   }
   if (!r.ok) return null;
@@ -153,6 +169,20 @@ export function encodeCall(event, peerId, peerNick) {
   return new Writer(S_CALL).u8(event).u16(peerId).str(peerNick).done();
 }
 
+/** Список для клиента: массив пакетов (страницы по LIST_PAGE записей). */
+export function encodeList(kind, entries) {
+  const pages = Math.max(1, Math.ceil(entries.length / LIST_PAGE));
+  const out = [];
+  for (let page = 0; page < pages; page++) {
+    const w = new Writer(S_LIST).u8(kind).u8(page).u8(pages).u16(entries.length);
+    const chunk = entries.slice(page * LIST_PAGE, (page + 1) * LIST_PAGE);
+    w.u8(chunk.length);
+    for (const e of chunk) w.u16(e.id).str(e.nick).u8(e.flags);
+    out.push(w.done());
+  }
+  return out;
+}
+
 export function encodeToken(token) {
   return new Writer(S_TOKEN).bytes(token).done();
 }
@@ -162,10 +192,13 @@ export function encodeNotice(code, text) {
 }
 
 // Client-side packet builders (tests and tools).
-export function encodeState({ playerId, x, y, z, interior = 0, room, nick, version = '0.4.0', radioFreq = 0, radioPass = '', token }) {
-  return new Writer(C_STATE).token(token).u16(playerId).f32(x).f32(y).f32(z).u8(interior)
-    .str(room).str(nick).str(version).u16(radioFreq).str(radioPass, 'utf8').done();
+export function encodeState({ playerId, x, y, z, interior = 0, room, nick, version = '0.5.0', radioFreq = 0, radioPass = '', token, flags }) {
+  const w = new Writer(C_STATE).token(token).u16(playerId).f32(x).f32(y).f32(z).u8(interior)
+    .str(room).str(nick).str(version).u16(radioFreq).str(radioPass, 'utf8');
+  if (flags !== undefined) w.u8(flags); // без flags — как клиент 0.4.x
+  return w.done();
 }
+export function encodeListRequest(kind, token) { return new Writer(C_LIST).token(token).u8(kind).done(); }
 export function encodeClientVoice(seq, mode, codec, payload, token) {
   return new Writer(C_VOICE).token(token).u16(seq).u8(mode).u8(codec).bytes(payload).done();
 }
@@ -187,7 +220,11 @@ export function decodeServer(buf) {
     p.payload = buf.subarray(r.off);
   } else if (type === S_CALL) p = { type, event: r.u8(), peerId: r.u16(), peerNick: r.str() };
   else if (type === S_NOTICE) p = { type, code: r.u8(), text: r.str('utf8') };
-  else if (type === S_TOKEN) { if (!r.need(TOKEN_LEN)) return null; p = { type, token: buf.subarray(r.off, r.off + TOKEN_LEN) }; }
+  else if (type === S_LIST) {
+    p = { type, kind: r.u8(), page: r.u8(), pages: r.u8(), total: r.u16(), entries: [] };
+    const n = r.u8();
+    for (let i = 0; i < n; i++) p.entries.push({ id: r.u16(), nick: r.str(), flags: r.u8() });
+  } else if (type === S_TOKEN) { if (!r.need(TOKEN_LEN)) return null; p = { type, token: buf.subarray(r.off, r.off + TOKEN_LEN) }; }
   else return null;
   return r.ok ? p : null;
 }

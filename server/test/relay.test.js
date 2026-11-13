@@ -38,7 +38,7 @@ const voiceTo = (sent) => of(sent, P.S_VOICE).map((s) => `${s.to}/${s.pkt.route}
 test('protocol round trip', () => {
   const token = Buffer.from('12345678');
   const s = P.decodeClient(P.encodeState({ playerId: 7, x: 1.5, y: -2, z: 3, interior: 4, room: ROOM, nick: 'A_B', version: '0.3.1', radioFreq: 9115, radioPass: 'пароль', token }));
-  assert.deepEqual({ ...s, token: s.token.toString() }, { type: P.C_STATE, playerId: 7, x: 1.5, y: -2, z: 3, interior: 4, room: ROOM, nick: 'A_B', version: '0.3.1', radioFreq: 9115, radioPass: 'пароль', token: '12345678' });
+  assert.deepEqual({ ...s, token: s.token.toString() }, { type: P.C_STATE, playerId: 7, x: 1.5, y: -2, z: 3, interior: 4, room: ROOM, nick: 'A_B', version: '0.3.1', radioFreq: 9115, radioPass: 'пароль', flags: 0, token: '12345678' });
   assert.equal(P.decodeClient(Buffer.from('TV\x03\x03abc')), null, 'packet shorter than a token');
   assert.equal(P.decodeClient(P.encodeClientVoice(1, 2, 1, Buffer.alloc(0))), null);
   assert.equal(P.decodeClient(Buffer.from('TV\x01\x01')), null, 'v1 packets rejected');
@@ -55,7 +55,7 @@ test('proximity voice goes only to nearby players, ack carries online count and 
   join(relay, 'b', 2, 10, 0);
   join(relay, 'c', 3, 200, 0);
   const ack = of(sent, P.S_ACK).at(-1).pkt;
-  assert.equal(ack.status, P.ACK_OK); assert.equal(ack.online, 3); assert.equal(ack.latestVersion, '0.4.1');
+  assert.equal(ack.status, P.ACK_OK); assert.equal(ack.online, 3); assert.equal(ack.latestVersion, '0.5.0');
   clear();
   speak(relay, 'a');
   assert.deepEqual(voiceTo(sent), ['b:1/0']);
@@ -300,4 +300,83 @@ test('admin key brute force is locked out; admin IP allowlist', () => {
   assert.equal(of(r2.sent, P.S_NOTICE).at(-1).pkt.code, P.NOTICE_ADMIN_DENIED);
   r2.relay.handle(P.encodeAdmin('super-secret-key', P.ADMIN_KICK, 'X', 0), '10.0.0.1', 1);
   assert.equal(of(r2.sent, P.S_NOTICE).at(-1).pkt.code, P.NOTICE_ADMIN_OK);
+});
+
+test('do-not-disturb: calls to a player with calls disabled are refused', () => {
+  const { relay, sent, clear } = setup();
+  join(relay, 'a', 1, 0, 0);
+  join(relay, 'b', 2, 900, 0, { flags: P.FLAG_DND });
+  clear();
+  relay.handle(P.encodeClientCall(P.CALL_INVITE, 2), 'a', 1);
+  assert.deepEqual(of(sent, P.S_CALL).map((s) => [s.to, s.pkt.event, s.pkt.peerNick]), [['a:1', P.EV_DND, 'Nick_2']]);
+  join(relay, 'b', 2, 900, 0, { flags: 0 }); // включил звонки обратно
+  clear();
+  relay.handle(P.encodeClientCall(P.CALL_INVITE, 2), 'a', 1);
+  assert.equal(of(sent, P.S_CALL)[0].pkt.event, P.EV_INCOMING);
+});
+
+test('old 0.4.x clients (no flags byte) still work', () => {
+  const { relay, sent } = setup();
+  join(relay, 'a', 1, 0, 0, { version: '0.4.1' }); // encodeState без flags
+  assert.equal(of(sent, P.S_ACK).at(-1).pkt.status, P.ACK_OK);
+  assert.equal(relay.clients.get('a:1').dnd, false);
+});
+
+test('room list: everyone on this SA-MP server with flags, paged, rate limited', () => {
+  const { relay, sent, clear, tick } = setup({ listCooldownMs: 1000 });
+  join(relay, 'a', 1, 0, 0);
+  join(relay, 'b', 2, 900, 0, { flags: P.FLAG_DND });
+  join(relay, 'c', 3, 50, 0);
+  relay.handle(P.encodeState({ playerId: 4, x: 0, y: 0, z: 0, room: 'other:7777', nick: 'Elsewhere' }), 'd', 1);
+  relay.handle(P.encodeClientCall(P.CALL_INVITE, 3), 'a', 1);
+  relay.handle(P.encodeClientCall(P.CALL_ACCEPT, 0), 'c', 1);
+  clear();
+  relay.handle(P.encodeListRequest(P.LIST_ROOM), 'a', 1);
+  const lists = of(sent, P.S_LIST);
+  assert.equal(lists.length, 1);
+  const l = lists[0].pkt;
+  assert.equal(l.kind, P.LIST_ROOM); assert.equal(l.pages, 1); assert.equal(l.total, 3);
+  assert.deepEqual(l.entries, [
+    { id: 1, nick: 'Nick_1', flags: P.FLAG_IN_CALL },
+    { id: 2, nick: 'Nick_2', flags: P.FLAG_DND },
+    { id: 3, nick: 'Nick_3', flags: P.FLAG_IN_CALL },
+  ], 'other SA-MP servers are not listed');
+  clear();
+  relay.handle(P.encodeListRequest(P.LIST_ROOM), 'a', 1);
+  assert.equal(sent.length, 0, 'rate limited');
+  tick(1100);
+  relay.handle(P.encodeListRequest(P.LIST_ROOM), 'a', 1);
+  assert.equal(of(sent, P.S_LIST).length, 1);
+});
+
+test('room list is split into pages', () => {
+  const { relay, sent, clear } = setup({ maxClientsPerIp: 1000 });
+  for (let i = 0; i < 95; i++) {
+    relay.handle(P.encodeState({ playerId: i, x: 0, y: 0, z: 0, room: ROOM, nick: 'P' + String(i).padStart(3, '0') }), 'ip', 1000 + i);
+  }
+  clear();
+  relay.handle(P.encodeListRequest(P.LIST_ROOM), 'ip', 1000);
+  const pages = of(sent, P.S_LIST).map((s) => s.pkt);
+  assert.equal(pages.length, 3);
+  assert.deepEqual(pages.map((p) => [p.page, p.pages, p.total, p.entries.length]), [[0, 3, 95, 40], [1, 3, 95, 40], [2, 3, 95, 15]]);
+  const raw = P.encodeList(P.LIST_ROOM, Array.from({ length: 40 }, (_, i) => ({ id: i, nick: 'X'.repeat(24), flags: 0 })));
+  assert.ok(raw[0].length < 1300, 'a full page fits in a safe UDP packet: ' + raw[0].length);
+});
+
+test('radio list: only players on my frequency, only if I am on it', () => {
+  const { relay, sent, clear } = setup({ radioPasswords: { '911.0': 'pw' } });
+  join(relay, 'a', 1, 0, 0, { radioFreq: 1000 });
+  join(relay, 'b', 2, 900, 0, { radioFreq: 1000 });
+  join(relay, 'c', 3, 0, 0, { radioFreq: 1005 });
+  join(relay, 'd', 4, 0, 0);
+  join(relay, 'e', 5, 0, 0, { radioFreq: 9110, radioPass: 'wrong' });
+  clear();
+  relay.handle(P.encodeListRequest(P.LIST_RADIO), 'a', 1);
+  assert.deepEqual(of(sent, P.S_LIST)[0].pkt.entries.map((e) => e.nick), ['Nick_1', 'Nick_2']);
+  clear();
+  relay.handle(P.encodeListRequest(P.LIST_RADIO), 'd', 1);
+  assert.equal(of(sent, P.S_LIST)[0].pkt.total, 0, 'no radio — empty list');
+  clear();
+  relay.handle(P.encodeListRequest(P.LIST_RADIO), 'e', 1);
+  assert.equal(of(sent, P.S_LIST)[0].pkt.total, 0, 'wrong password — cannot see who is on a locked frequency');
 });

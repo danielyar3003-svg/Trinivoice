@@ -375,4 +375,97 @@ function Ring:wav()
   return A.wav(self.rate, buf, n)
 end
 
+
+---------------------------------------------------------------------------
+-- Громкость выше 100%: усиление с мягким ограничением (без хрипа на пиках)
+---------------------------------------------------------------------------
+
+local KNEE = 26000
+function A.applyGain(buf, n, g)
+  if g == 1 then return end
+  for i = 0, n - 1 do
+    local v = buf[i] * g
+    local a = math.abs(v)
+    if a > KNEE then
+      a = KNEE + (32767 - KNEE) * math.tanh((a - KNEE) / (32767 - KNEE))
+      v = v < 0 and -a or a
+    end
+    buf[i] = math.floor(v + 0.5)
+  end
+end
+
+---------------------------------------------------------------------------
+-- Свои звуки: WAV (PCM 8/16 бит, моно/стерео, любая частота)
+---------------------------------------------------------------------------
+
+local function rd16(s, i) local a, b = s:byte(i, i + 1); return a + b * 256 end
+local function rd32(s, i) local a, b, c, d = s:byte(i, i + 3); return a + b * 256 + c * 65536 + d * 16777216 end
+
+-- Разбирает WAV из строки. Возвращает { rate, n, buf (int16, моно) } или nil, причина.
+function A.parseWav(data, maxSeconds)
+  if type(data) ~= 'string' or #data < 44 or data:sub(1, 4) ~= 'RIFF' or data:sub(9, 12) ~= 'WAVE' then
+    return nil, 'это не WAV-файл'
+  end
+  local pos, fmt, dataPos, dataLen = 13, nil, nil, nil
+  while pos + 8 <= #data do
+    local id, size = data:sub(pos, pos + 3), rd32(data, pos + 4)
+    local body = pos + 8
+    if id == 'fmt ' and size >= 16 then
+      fmt = { format = rd16(data, body), channels = rd16(data, body + 2), rate = rd32(data, body + 4), bits = rd16(data, body + 14) }
+    elseif id == 'data' then
+      dataPos, dataLen = body, math.min(size, #data - body + 1)
+      break
+    end
+    pos = body + size + (size % 2)
+  end
+  if not fmt or not dataPos then return nil, 'повреждённый WAV' end
+  if fmt.format ~= 1 and fmt.format ~= 0xFFFE then return nil, 'нужен несжатый WAV (PCM)' end
+  if fmt.bits ~= 16 and fmt.bits ~= 8 then return nil, 'нужен WAV 16 или 8 бит' end
+  if fmt.channels < 1 or fmt.channels > 2 or fmt.rate < 4000 or fmt.rate > 96000 then
+    return nil, 'нужен моно или стерео WAV 4000-96000 Гц'
+  end
+  local bytesPer = fmt.bits / 8 * fmt.channels
+  local n = math.floor(dataLen / bytesPer)
+  if maxSeconds and n > fmt.rate * maxSeconds then
+    return nil, ('слишком длинный: больше %d сек'):format(maxSeconds)
+  end
+  if n < 1 then return nil, 'пустой WAV' end
+  local buf = ffi.new('int16_t[?]', n)
+  local p = ffi.cast('const uint8_t *', data) + (dataPos - 1)
+  if fmt.bits == 16 then
+    local s16 = ffi.cast('const int16_t *', p)
+    for i = 0, n - 1 do
+      if fmt.channels == 2 then buf[i] = math.floor((s16[2 * i] + s16[2 * i + 1]) / 2)
+      else buf[i] = s16[i] end
+    end
+  else
+    for i = 0, n - 1 do
+      if fmt.channels == 2 then buf[i] = ((p[2 * i] + p[2 * i + 1]) / 2 - 128) * 256
+      else buf[i] = (p[i] - 128) * 256 end
+    end
+  end
+  return { rate = fmt.rate, n = n, buf = buf, data = data }
+end
+
+-- Пересчёт частоты (линейная интерполяция). Возвращает новый буфер и длину.
+function A.resample(src, n, from, to)
+  if from == to then
+    local out = ffi.new('int16_t[?]', n)
+    ffi.copy(out, src, n * 2)
+    return out, n
+  end
+  local m = math.max(1, math.floor(n * to / from))
+  local out = ffi.new('int16_t[?]', m)
+  local step = from / to
+  for i = 0, m - 1 do
+    local x = i * step
+    local j = math.floor(x)
+    local f = x - j
+    local a = src[math.min(j, n - 1)]
+    local b = src[math.min(j + 1, n - 1)]
+    out[i] = math.floor(a + (b - a) * f + 0.5)
+  end
+  return out, m
+end
+
 return A

@@ -8,9 +8,12 @@
     "911.0": "сменить-пароль-lspd"
   },
   "admins": [
-    { "name": "Admin", "key": "замените-на-длинный-случайный-ключ" }
+    {
+      "name": "Admin",
+      "key": "замените-на-длинный-случайный-ключ"
+    }
   ],
-  "latestClientVersion": "0.4.1",
+  "latestClientVersion": "0.5.0",
   "minClientVersion": "0.4.0",
   "adminIps": [],
   "maxClients": 2000,
@@ -21,5 +24,6 @@
   "maxVoicePacketsPerSec": 60,
   "maxPayloadBytes": 512,
   "rangeMargin": 1.25,
-  "rangeSlack": 5
+  "rangeSlack": 5,
+  "listCooldownMs": 1500
 }

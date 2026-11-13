@@ -119,6 +119,7 @@ local function newClient(id, nick, x, y, iniData)
   env.isSampfuncsConsoleActive = function() return false end
   env.getWorkingDirectory = function() return TMP end
   env.doesDirectoryExist = function() return true end
+  env.doesFileExist = function(path) local f = io.open(path, 'rb'); if f then f:close(); return true end return false end
   env.thisScript = function() return env end
 
   local chunk = assert(loadfile(SCRIPT))
@@ -168,6 +169,21 @@ local function test(name, fn)
   end
 end
 
+-- Свои звуки, как их положил бы админ в moonloader/resource/trinivoice/sounds/
+-- (getWorkingDirectory() в эмуляции = TMP, разделители путей как в Windows).
+local function soundPath(name) return TMP .. '\\resource\\trinivoice\\sounds\\' .. name end
+do
+  local function le(n, k) local t = {} for _ = 1, k do t[#t + 1] = string.char(n % 256); n = math.floor(n / 256) end return table.concat(t) end
+  local rate, frames = 16000, 8000 -- 0.5 сек
+  local body = {}
+  for i = 0, frames - 1 do local v = math.floor(math.sin(i / 3) * 8000); body[#body + 1] = le(v < 0 and v + 65536 or v, 2) end
+  local data = table.concat(body)
+  local wav = 'RIFF' .. le(36 + #data, 4) .. 'WAVE' .. 'fmt ' .. le(16, 4) .. le(1, 2) .. le(1, 2) .. le(rate, 4) ..
+    le(rate * 2, 4) .. le(2, 2) .. le(16, 2) .. 'data' .. le(#data, 4) .. data
+  local f = assert(io.open(soundPath('ring.wav'), 'wb')); f:write(wav); f:close()
+  f = assert(io.open(soundPath('radio_on.wav'), 'wb')); f:write('ID3 это mp3, а не wav'); f:close()
+end
+
 local a = newClient(1, 'Ivan_Petrov', 0, 0)
 local b = newClient(2, 'Anna_Smirnova', 5, 0)
 -- C получил архив от админа: в ini вписан только адрес ретранслятора
@@ -183,6 +199,7 @@ local function hold(cl, key, steps) cl.st.keys[key] = true; run(steps); cl.st.ke
 test('all clients connect to the relay', function()
   run(30)
   for _, cl in ipairs(clients) do assert(cl.saw('подключено к голосовому серверу'), cl.nick .. ' not connected') end
+  updateSeen = b.saw('доступна новая версия 9.9.9') and c.saw('доступна новая версия 9.9.9')
 end)
 
 test('proximity: neighbour hears, far player does not', function()
@@ -277,6 +294,52 @@ test('automatic call from server chat messages (both sides dial at once)', funct
   a.cmd('autocall off'); c.cmd('autocall off')
 end)
 
+test('player list: everyone with TriniVoice on this SA-MP server', function()
+  a.st.chat = {}
+  a.cmd('players')
+  run(10)
+  assert(a.saw('с TriniVoice на сервере: 3'), 'count')
+  assert(a.saw('Anna_Smirnova [2]') and a.saw('Ivan_Petrov [1]') and a.saw('Sergey_Orlov [3]'), 'names')
+end)
+
+test('frequency list: who is on my frequency', function()
+  a.cmd('radio 123.4'); c.cmd('radio 123.4')
+  run(15)
+  a.cmd('freqlist')
+  run(10)
+  assert(a.saw('на частоте 123.4: 2'), 'count on frequency')
+  b.st.chat = {}
+  b.cmd('freqlist')
+  assert(b.saw('рация выключена'), 'no radio — no list')
+  a.cmd('radio off'); c.cmd('radio off')
+  run(5)
+end)
+
+test('do not disturb: nobody can call, list shows it', function()
+  c.cmd('dnd on')
+  run(15)
+  a.cmd('call 3')
+  run(10)
+  assert(a.saw('Sergey_Orlov [3] не принимает звонки'), 'caller is told')
+  a.st.chat = {}
+  socket.sleep(1.6) -- ретранслятор отдаёт список не чаще раза в 1.5 сек (реального времени)
+  a.cmd('players')
+  run(10)
+  assert(a.saw('Sergey_Orlov [3] (без звонков)'), 'list marks the player')
+  c.cmd('dnd off')
+  run(15)
+end)
+
+test('custom sounds: a good WAV replaces the ringtone, a bad file is reported', function()
+  local before = c.st.put[c.st.fx]
+  a.cmd('call 3')
+  run(5)
+  local played = c.st.put[c.st.fx] - before
+  assert(played == 8000 * 2, 'custom 0.5 s ring at 16 kHz = 16000 bytes, got ' .. played)
+  a.cmd('hangup'); run(10)
+  assert(c.saw('звук radio_on.wav: это не WAV-файл, играет стандартный'), 'bad file is reported')
+end)
+
 test('report saves the last seconds of voice and reaches the relay', function()
   b.cmd('report 1 тестовая жалоба')
   run(10)
@@ -315,7 +378,7 @@ test('admin mutes a player; muted player is not relayed', function()
 end)
 
 test('update notice when relay advertises a newer version', function()
-  assert(b.saw('доступна новая версия 9.9.9') and c.saw('доступна новая версия 9.9.9'), 'relay config advertises 9.9.9')
+  assert(updateSeen, 'relay config advertises 9.9.9') -- запомнено в первом тесте: чаты потом очищаются
 end)
 
 for _, cl in ipairs(clients) do cl.cmd('off') end

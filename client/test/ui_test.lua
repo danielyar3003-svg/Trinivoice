@@ -177,7 +177,12 @@ local function makeCtx(players)
     mic_gain = 150, master_volume = 80, vad_threshold = 700, codec = 'ulaw', show_icons = true,
     show_hud = true, accent = '#6E8BFF', host = '1.2.3.4', port = 7790, radio_on = true, radio_freq = 911.0,
     radio_pass = '', radio_key = 0x5A, radio_volume = 90, occlusion = true, fx_radio = true, megaphone = true,
-    ptt_sound = false }, muted = {}, volume = {} }
+    ptt_sound = false, dnd = false }, muted = {}, volume = {} }
+  local roomList = { entries = {
+    { id = 1, nick = 'Ivan_Petrov', flags = 0 }, { id = 7, nick = 'Me_Myself', flags = 0 },
+    { id = 8, nick = 'Sergey_Orlov', flags = 2 }, { id = 9, nick = 'Quiet_Guy', flags = 1 },
+  }, at = 5 }
+  local requested = {}
   local callStates = { false, 'in', 'out', 'active' }
   local frameNo = 0
   local ctx = {
@@ -201,6 +206,14 @@ local function makeCtx(players)
     hangup = function() end,
     report = function(id, reason) assert(type(id) == 'number' and type(reason) == 'string' and #reason > 0); log[#log + 1] = 'report' end,
     setRadio = function(on, freq) assert(on == nil or type(on) == 'boolean'); return true end,
+    lists = function(kind)
+      assert(kind == 1 or kind == 2)
+      if frameNo % 3 == 0 then return { entries = {}, at = frameNo % 2 == 0 and -100 or 3 } end -- загрузка / пусто
+      return roomList
+    end,
+    requestList = function(kind) assert(kind == 1 or kind == 2); requested[kind] = true; log[#log + 1] = 'list' .. kind end,
+    myId = function() return 7 end,
+    setDnd = function(on) assert(type(on) == 'boolean'); cfg.main.dnd = on end,
     radioPresets = function() return frameNo % 2 == 0 and { { name = 'LSPD', freq = 911.0 }, { name = 'EMS', freq = 912.5 } } or {} end,
     players = function() return players end,
     set = function(k, v) log[#log + 1] = 'set ' .. k; cfg.main[k] = v end,
@@ -210,7 +223,7 @@ local function makeCtx(players)
     setCodec = function(c) assert(c == 'ulaw' or c == 'opus') end,
     setServer = function(h, p) end,
     toggleMute = function(n) assert(type(n) == 'string') end,
-    setVolume = function(n, v) assert(type(n) == 'string' and v >= 0 and v <= 100) end,
+    setVolume = function(n, v) assert(type(n) == 'string' and v >= 0 and v <= 200, 'volume ' .. v) end,
     binding = function() return nil end,
     startBinding = function(w) assert(w == 'ptt' or w == 'mode' or w == 'radio') end,
     keyName = function(k) return k == 0x58 and 'X' or 'B' end,
@@ -291,7 +304,7 @@ test('every page reached', function()
   ui.init(ctx)
   initCb[1]()
   local seen = {}
-  local titles = { 'Главная', 'Игроки рядом', 'Звук', 'Рация', 'Сервер' }
+  local titles = { 'Главная', 'Игроки', 'Звук', 'Рация', 'Сервер' }
   ui.open()
   for _ = 1, 600 do
     reset()
@@ -318,6 +331,24 @@ test('report flow reaches ctx.report', function()
   local reported = false
   for _, l in ipairs(log) do if l == 'report' then reported = true end end
   assert(reported, 'random clicks never completed a report')
+end)
+
+test('server list and frequency list are requested while visible', function()
+  local ui = loadUi(true)
+  local ctx, log = makeCtx(PLAYERS)
+  ui.init(ctx)
+  initCb[1]()
+  ui.open()
+  local seen = {}
+  for _ = 1, 3000 do
+    reset(); frameCb[1].cb({})
+    for _, l in ipairs(log) do seen[l] = true end
+    for _, c in ipairs(calls) do if c == 'Позвонить' or c:find('Позвонить', 1, true) then seen.callBtn = true end end
+    if seen.list1 and seen.list2 and seen.callBtn then break end
+  end
+  assert(seen.list1, 'server list never requested')
+  assert(seen.list2, 'frequency list never requested')
+  assert(seen.callBtn, 'no call button in the server list')
 end)
 
 test('script-side API never touches mimgui outside a frame', function()

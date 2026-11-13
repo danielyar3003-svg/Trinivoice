@@ -12,8 +12,10 @@ P.TOKEN_LEN = 8
 P.token = string.rep('\0', P.TOKEN_LEN)
 function P.setToken(t) if #t == P.TOKEN_LEN then P.token = t end end
 
-P.C_STATE, P.C_VOICE, P.C_BYE, P.C_CALL, P.C_REPORT, P.C_ADMIN = 0x01, 0x02, 0x03, 0x04, 0x05, 0x06
-P.S_ACK, P.S_VOICE, P.S_CALL, P.S_NOTICE, P.S_TOKEN = 0x81, 0x82, 0x83, 0x84, 0x85
+P.C_STATE, P.C_VOICE, P.C_BYE, P.C_CALL, P.C_REPORT, P.C_ADMIN, P.C_LIST = 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
+P.S_ACK, P.S_VOICE, P.S_CALL, P.S_NOTICE, P.S_TOKEN, P.S_LIST = 0x81, 0x82, 0x83, 0x84, 0x85, 0x86
+P.LIST_ROOM, P.LIST_RADIO = 1, 2          -- все на SA-MP сервере / все на моей частоте
+P.FLAG_DND, P.FLAG_IN_CALL = 1, 2          -- не принимает звонки / разговаривает
 
 P.ACK_OK, P.ACK_ROOM, P.ACK_ID_TAKEN, P.ACK_BANNED, P.ACK_MUTED, P.ACK_OUTDATED, P.ACK_FULL = 0, 1, 2, 3, 4, 5, 6
 
@@ -24,7 +26,7 @@ P.ROUTE_NEAR, P.ROUTE_RADIO, P.ROUTE_PHONE = 0, 1, 2
 P.CODEC_ULAW, P.CODEC_OPUS = 1, 2
 
 P.CALL_INVITE, P.CALL_ACCEPT, P.CALL_HANGUP = 1, 2, 3
-P.EV_INCOMING, P.EV_STARTED, P.EV_ENDED, P.EV_UNAVAILABLE, P.EV_BUSY, P.EV_RINGING = 1, 2, 3, 4, 5, 6
+P.EV_INCOMING, P.EV_STARTED, P.EV_ENDED, P.EV_UNAVAILABLE, P.EV_BUSY, P.EV_RINGING, P.EV_DND = 1, 2, 3, 4, 5, 6, 7
 
 P.ADMIN_MUTE, P.ADMIN_UNMUTE, P.ADMIN_BAN, P.ADMIN_UNBAN, P.ADMIN_KICK = 1, 2, 3, 4, 5
 
@@ -51,10 +53,12 @@ local function head(t) return HDR .. u8(t) .. P.token end
 
 function P.packState(t)
   return head(P.C_STATE) .. u16(t.id) .. f32(t.x) .. f32(t.y) .. f32(t.z) .. u8(t.interior or 0) ..
-    str(t.room) .. str(t.nick) .. str(t.version) .. u16(t.radioFreq or 0) .. str(t.radioPass)
+    str(t.room) .. str(t.nick) .. str(t.version) .. u16(t.radioFreq or 0) .. str(t.radioPass) ..
+    u8(t.flags or 0)
 end
 function P.packVoice(seq, mode, codec, payload) return head(P.C_VOICE) .. u16(seq) .. u8(mode) .. u8(codec) .. payload end
 function P.packBye() return head(P.C_BYE) end
+function P.packListRequest(kind) return head(P.C_LIST) .. u8(kind) end
 function P.packCall(action, target) return head(P.C_CALL) .. u8(action) .. u16(target or 0) end
 function P.packReport(target, reason) return head(P.C_REPORT) .. u16(target) .. str(reason) end
 function P.packAdmin(key, action, nick, minutes)
@@ -94,6 +98,11 @@ function P.parseServer(s)
     p = { type = t, event = r:u8(), peerId = r:u16(), peerNick = r:str() }
   elseif t == P.S_NOTICE then
     p = { type = t, code = r:u8(), text = r:str() }
+  elseif t == P.S_LIST then
+    p = { type = t, kind = r:u8(), page = r:u8(), pages = r:u8(), total = r:u16(), entries = {} }
+    for _ = 1, r:u8() do
+      p.entries[#p.entries + 1] = { id = r:u16(), nick = r:str(), flags = r:u8() }
+    end
   elseif t == P.S_TOKEN then
     if not r:need(P.TOKEN_LEN) then return nil end
     p = { type = t, token = s:sub(r.pos, r.pos + P.TOKEN_LEN - 1) }
