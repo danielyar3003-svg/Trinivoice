@@ -18,5 +18,16 @@ mkdir -p "$T/moonloader/config"
 printf '[main]\r\nhost=%s\r\nport=%s\r\n' "$HOST" "$PORT" > "$T/moonloader/config/trinivoice.ini"
 cp "$SRC/client/ПРОЧИТАЙ_МЕНЯ.txt" "$T/"
 rm -f "$OUT"
-(cd "$T" && zip -qr "$OUT" .)
+# Архив собирает Python: он помечает имена файлов как UTF-8, и Проводник Windows
+# показывает русские имена правильно (zip из Linux этого не делает).
+python3 -I - "$T" "$OUT" <<'PY'
+import os, sys, zipfile
+src, out = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
+    for root, dirs, files in os.walk(src):
+        dirs.sort()
+        for f in sorted(files):
+            p = os.path.join(root, f)
+            z.write(p, os.path.relpath(p, src))
+PY
 echo "$OUT"

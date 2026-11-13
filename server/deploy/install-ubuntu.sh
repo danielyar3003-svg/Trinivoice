@@ -12,7 +12,7 @@ SRC="$(cd "$(dirname "$0")/.." && pwd)"
 echo "== 1/7 Пакеты (Node.js из репозитория Ubuntu, без сторонних источников)"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
-apt-get install -y -q nodejs iptables-persistent unattended-upgrades zip curl
+apt-get install -y -q nodejs iptables-persistent unattended-upgrades python3 curl
 NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
 if (( NODE_MAJOR < 18 )); then
   echo "Нужен Node.js 18+, в системе $(node -v). Создайте сервер на образе Ubuntu 24.04."
