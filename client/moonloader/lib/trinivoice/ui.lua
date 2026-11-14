@@ -464,9 +464,20 @@ local function pageHome(st)
   card(mx, y, hw, 192)
   sectionTitle(mx + 16, y + 14, 'Микрофон')
   local label, col = micLabel(st)
-  local lsz = textSize(label, fonts.small)
-  text(mx + hw - 16 - lsz.x, y + 17, label, col, fonts.small)
-  drawMeter(mx + 16, y + 44, hw - 32, 50, st)
+  text(mx + 16, y + 34, label, col, fonts.small)
+  -- прослушать себя: 4 сек записи, потом воспроизведение
+  local mt = ctx.micTest()
+  local bw, bh = 150, 28
+  local bx = mx + hw - 16 - bw
+  if not mt then
+    if button('##mictest', bx, y + 10, bw, bh, 'Прослушать себя') then ctx.startMicTest() end
+  else
+    local busy = mt.phase == 'rec' and ('Говорите… %d'):format(math.ceil(mt.left)) or 'Слушайте…'
+    rect(bx, y + 10, bw, bh, mt.phase == 'rec' and alpha(C.red, 0.25) or mix(C.key, acc, 0.25), 9)
+    local sz = textSize(busy, fonts.bold)
+    text(bx + (bw - sz.x) / 2, y + 10 + (bh - sz.y) / 2, busy, C.white, fonts.bold)
+  end
+  drawMeter(mx + 16, y + 54, hw - 32, 42, st)
   text(mx + 16, y + 112, 'Усиление', C.soft)
   local gv = ('%d%%'):format(m.mic_gain)
   local gsz = textSize(gv, fonts.bold)

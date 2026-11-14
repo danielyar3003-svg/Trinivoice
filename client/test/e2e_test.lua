@@ -340,6 +340,25 @@ test('custom sounds: a good WAV replaces the ringtone, a bad file is reported', 
   assert(c.saw('звук radio_on.wav: это не WAV-файл, играет стандартный'), 'bad file is reported')
 end)
 
+test('mic test: you hear yourself, nobody else hears anything', function()
+  local before = a.st.put[a.st.fx]
+  local b0 = b.received()
+  a.st.chat = {}
+  a.cmd('mictest')
+  assert(a.saw('проверка микрофона: говорите 4 секунды'), 'started')
+  a.st.keys[X] = true -- даже если держать клавишу разговора, в эфир ничего не уходит
+  run(4 / 0.02 + 10)
+  a.st.keys[X] = nil
+  local played = a.st.put[a.st.fx] - before
+  -- 4 сек записи u-law 8 кГц, пересчитанные в 16 кГц для воспроизведения
+  assert(played > 4 * 16000 * 2 * 0.9 and played < 5 * 16000 * 2, 'played back ' .. played .. ' bytes')
+  assert(b.received() == b0, 'neighbour must not hear the test')
+  run(250) -- воспроизведение закончилось — снова можно говорить
+  b0 = b.received()
+  hold(a, X, 25)
+  assert(b.received() - b0 > 3000, 'talking works again after the test')
+end)
+
 test('report saves the last seconds of voice and reaches the relay', function()
   b.cmd('report 1 тестовая жалоба')
   run(10)

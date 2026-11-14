@@ -8,7 +8,7 @@
 --   audio.lua     кодеки, эффекты (рация, телефон, мегафон, стены), служебные звуки, WAV
 --   ui.lua        меню /tv на mimgui (необязательно)
 
-local SCRIPT_VERSION = '0.5.0'
+local SCRIPT_VERSION = '0.5.1'
 script_name('TriniVoice')
 script_author('TriniVoice')
 script_version(SCRIPT_VERSION)
@@ -342,8 +342,13 @@ local function inputBusy()
 end
 
 -- Каким режимом сейчас говорим (nil = молчим) и открыт ли канал без активации голосом.
+-- Проверка микрофона: 4 сек записи, потом воспроизведение себе (через тот же
+-- кодек, что и в эфире). Пока идёт проверка, в эфир ничего не уходит.
+local MIC_TEST_SECONDS = 4
+local micTest -- nil | { phase = 'rec'|'play', untilAt, ring, dec }
+
 local function wantedMode()
-  if not canTalk() then return nil end
+  if micTest or not canTalk() then return nil end
   local m = cfg.main
   local busy = inputBusy()
   if radioWire() > 0 and not busy and isKeyDown(m.radio_key) then return P.MODE_RADIO, true end
@@ -377,7 +382,7 @@ local function processCapture(now)
   tx.mode = mode
 
   -- пока открыто меню, микрофон пишется для индикатора, но в эфир не идёт
-  local wantRecord = mode ~= nil or tx.monitor
+  local wantRecord = mode ~= nil or tx.monitor or (micTest ~= nil and micTest.phase == 'rec')
   if wantRecord and not tx.recording then
     drainRecording()
     bass.BASS_ChannelPlay(rec, 0)
@@ -404,6 +409,13 @@ local function processCapture(now)
     if bass.BASS_ChannelGetData(rec, pcmIn, frameBytes) ~= frameBytes then break end
     local rms = A.applyGainAndRms(pcmIn, codec.frame, gain)
     tx.level = math.max(A.levelFromRms(rms), tx.level * 0.8)
+    if micTest and micTest.phase == 'rec' then
+      -- кодируем и сразу раскодируем: вы услышите ровно то, что слышат другие
+      local payload = codec.encode(pcmIn, codec.frame)
+      local pcm, n = nil, 0
+      if payload then pcm, n = micTest.dec:decode(payload) end
+      if pcm and n > 0 then micTest.ring:push(pcm, n) end
+    end
     local open = mode ~= nil
     if open and not forced then
       if rms >= cfg.main.vad_threshold then tx.vadUntil = now + 0.35 end
@@ -629,6 +641,35 @@ local function onCall(p, now)
     local auto = autoCall[p.peerNick:lower()]
     if auto and now - auto < 15 then return end
     msg('занято: ' .. (p.peerNick ~= '' and p.peerNick or ('ID ' .. p.peerId)) .. ' уже разговаривает')
+  end
+end
+
+local function startMicTest()
+  if micTest then return false end
+  if not rec then msg('микрофон недоступен: проверка невозможна'); return false end
+  local dec = codec.newDecoder()
+  if not dec then return false end
+  micTest = { phase = 'rec', untilAt = os.clock() + MIC_TEST_SECONDS, dec = dec,
+    ring = A.newRing(codec.rate, MIC_TEST_SECONDS + 1) }
+  msg(('проверка микрофона: говорите %d секунды, потом услышите себя'):format(MIC_TEST_SECONDS))
+  return true
+end
+
+local function processMicTest(now)
+  if not micTest or now < micTest.untilAt then return end
+  if micTest.phase == 'rec' then
+    local buf, n = micTest.ring:samples()
+    if n < codec.rate / 4 or not fxStream or fxStream == 0 then
+      msg('голос не записался: проверьте микрофон в Windows')
+      micTest = nil
+      return
+    end
+    local out, m = A.resample(buf, n, codec.rate, LOCAL_RATE)
+    bass.BASS_ChannelSetAttribute(fxStream, 2, cfg.main.master_volume / 100)
+    bass.BASS_StreamPutData(fxStream, out, m * 2)
+    micTest = { phase = 'play', untilAt = now + m / LOCAL_RATE + 0.3 }
+  else
+    micTest = nil
   end
 end
 
@@ -984,6 +1025,11 @@ local uiContext = {
     return ok and id or -1
   end,
   setDnd = function(on) cfg.main.dnd = on; net.lastState = 0; markDirty() end,
+  startMicTest = startMicTest,
+  micTest = function()
+    if not micTest then return nil end
+    return { phase = micTest.phase, left = math.max(0, micTest.untilAt - os.clock()) }
+  end,
 }
 
 ---------------------------------------------------------------------------
@@ -999,6 +1045,7 @@ local HELP = {
   '/tv mute ID | unmute ID, /tv vol ID 0-200, /tv master 0-100, /tv gain 50-400',
   '/tv players - все с TriniVoice на сервере, /tv freqlist - кто на моей частоте',
   '/tv dnd on | off - не принимать звонки / снова принимать',
+  '/tv mictest - прослушать свой голос (4 секунды записи, потом воспроизведение)',
   '/tv report ID причина - жалоба (сохраняет запись голоса)',
   '/tv codec ulaw | opus, /tv icons, /tv hud, /tv server HOST PORT',
   '/tv autocall on | off, /tv autocall start|end ШАБЛОН - звонки по сообщениям сервера',
@@ -1037,6 +1084,8 @@ local function onCommand(args)
     msg(m.radio_on and ('рация включена, частота ' .. P.freqLabel(radioWire()) .. ', клавиша ' .. keyName(m.radio_key)) or 'рация выключена')
   elseif c == 'radiopass' then
     m.radio_pass = a[2] and A.u8(a[2]) or ''; msg(a[2] and 'пароль частоты задан' or 'пароль частоты сброшен')
+  elseif c == 'mictest' then
+    startMicTest(); return
   elseif c == 'players' then
     listPrint[P.LIST_ROOM] = true; requestList(P.LIST_ROOM); return
   elseif c == 'freqlist' then
@@ -1141,6 +1190,7 @@ function main()
     processNetwork(now)
     processCapture(now)
     processRinging(now)
+    processMicTest(now)
     if cfg.main.enabled and sampIsLocalPlayerSpawned() then updateSpeakers(now) end
     render(now)
     if dirtyAt and now - dirtyAt > 1 then dirtyAt = nil; save() end

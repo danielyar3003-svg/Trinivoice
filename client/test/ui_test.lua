@@ -214,6 +214,12 @@ local function makeCtx(players)
     requestList = function(kind) assert(kind == 1 or kind == 2); requested[kind] = true; log[#log + 1] = 'list' .. kind end,
     myId = function() return 7 end,
     setDnd = function(on) assert(type(on) == 'boolean'); cfg.main.dnd = on end,
+    micTest = function()
+      local k = frameNo % 9
+      if k < 3 then return nil end
+      return { phase = k < 6 and 'rec' or 'play', left = 2.4 }
+    end,
+    startMicTest = function() log[#log + 1] = 'mictest'; return true end,
     radioPresets = function() return frameNo % 2 == 0 and { { name = 'LSPD', freq = 911.0 }, { name = 'EMS', freq = 912.5 } } or {} end,
     players = function() return players end,
     set = function(k, v) log[#log + 1] = 'set ' .. k; cfg.main[k] = v end,
