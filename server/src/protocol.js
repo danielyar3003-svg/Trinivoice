@@ -73,6 +73,7 @@ export const ADMIN_UNMUTE = 2;
 export const ADMIN_BAN = 3;
 export const ADMIN_UNBAN = 4;
 export const ADMIN_KICK = 5;
+export const ADMIN_STATS = 6; // статистика установок (ник не нужен)
 
 export const NOTICE_ADMIN_OK = 1;
 export const NOTICE_ADMIN_DENIED = 2;

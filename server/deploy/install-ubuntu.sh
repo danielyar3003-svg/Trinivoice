@@ -30,6 +30,12 @@ cp -r "$SRC/src" "$SRC/package.json" /opt/trinivoice/app/
 chown -R root:root /opt/trinivoice/app
 chmod -R a+rX,go-w /opt/trinivoice/app
 install -d -o trinivoice -g trinivoice -m 700 /var/lib/trinivoice
+# команда для админа: sudo trinivoice-stats
+cat > /usr/local/bin/trinivoice-stats <<'EOS'
+#!/bin/sh
+exec /usr/bin/node /opt/trinivoice/app/src/stats-cli.js /var/lib/trinivoice/stats.json "$@"
+EOS
+chmod 755 /usr/local/bin/trinivoice-stats
 install -d -o root -g trinivoice -m 750 /etc/trinivoice
 
 echo "== 4/7 Настройки"
@@ -93,4 +99,5 @@ echo " Не забудьте открыть UDP $PORT в Security List Oracle (�
 echo " Настройки: sudo nano /etc/trinivoice/config.json"
 echo "            потом sudo systemctl restart trinivoice"
 echo " Журнал:    sudo journalctl -u trinivoice -f"
+echo " Статистика: sudo trinivoice-stats   (в игре: /tv admin stats)"
 echo "================================================================"

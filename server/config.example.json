@@ -13,7 +13,7 @@
       "key": "замените-на-длинный-случайный-ключ"
     }
   ],
-  "latestClientVersion": "0.5.1",
+  "latestClientVersion": "0.5.2",
   "minClientVersion": "0.4.0",
   "adminIps": [],
   "maxClients": 2000,

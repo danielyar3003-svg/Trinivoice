@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Relay } from './relay.js';
 import { Moderation } from './moderation.js';
+import { Stats } from './stats.js';
 
 const configPath = process.argv[2] ?? process.env.TRINIVOICE_CONFIG ?? 'config.json';
 let config = {};
@@ -25,6 +26,7 @@ const relay = new Relay({
   config,
   send: (buf, address, p) => socket.send(buf, p, address),
   moderation: new Moderation({ file: path.join(dataDir, 'moderation.json') }),
+  usage: new Stats({ file: path.join(dataDir, 'stats.json') }),
   onReport: (record) => fs.appendFileSync(reportsFile, JSON.stringify(record) + '\n'),
   log,
 });
@@ -37,6 +39,10 @@ socket.bind(port, host, () => log(`relay listening on udp://${host}:${port}, dat
 setInterval(() => relay.sweep(), 1000).unref();
 setInterval(() => log(relay.summary()), 60000).unref();
 
-const shutdown = () => { socket.close(); process.exit(0); };
+const shutdown = () => {
+  try { relay.usage.save(); } catch (e) { log(`stats not saved: ${e.message}`); }
+  socket.close();
+  process.exit(0);
+};
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);

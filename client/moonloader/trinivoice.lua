@@ -8,7 +8,7 @@
 --   audio.lua     кодеки, эффекты (рация, телефон, мегафон, стены), служебные звуки, WAV
 --   ui.lua        меню /tv на mimgui (необязательно)
 
-local SCRIPT_VERSION = '0.5.1'
+local SCRIPT_VERSION = '0.5.2'
 script_name('TriniVoice')
 script_author('TriniVoice')
 script_version(SCRIPT_VERSION)
@@ -731,7 +731,8 @@ local function report(id, reason)
   sendPacket(P.packReport(id, reason ~= '' and reason or 'без причины'))
 end
 
-local ADMIN_ACTIONS = { mute = P.ADMIN_MUTE, unmute = P.ADMIN_UNMUTE, ban = P.ADMIN_BAN, unban = P.ADMIN_UNBAN, kick = P.ADMIN_KICK }
+local ADMIN_ACTIONS = { mute = P.ADMIN_MUTE, unmute = P.ADMIN_UNMUTE, ban = P.ADMIN_BAN, unban = P.ADMIN_UNBAN, kick = P.ADMIN_KICK,
+  stats = P.ADMIN_STATS }
 
 local function admin(action, nick, minutes)
   local key = tostring(cfg.main.admin_key or '')
@@ -1049,7 +1050,7 @@ local HELP = {
   '/tv report ID причина - жалоба (сохраняет запись голоса)',
   '/tv codec ulaw | opus, /tv icons, /tv hud, /tv server HOST PORT',
   '/tv autocall on | off, /tv autocall start|end ШАБЛОН - звонки по сообщениям сервера',
-  '/tv adminkey КЛЮЧ, /tv admin mute|unmute|ban|unban|kick НИК [минуты]',
+  '/tv adminkey КЛЮЧ, /tv admin mute|unmute|ban|unban|kick НИК [минуты], /tv admin stats',
 }
 
 local function nickById(arg)
@@ -1134,6 +1135,8 @@ local function onCommand(args)
     msg((a[2] == 'start' and 'шаблон начала звонка: ' or 'шаблон конца звонка: ') .. A.u8(pattern))
   elseif c == 'adminkey' then
     m.admin_key = a[2] or ''; msg(a[2] and 'ключ администратора сохранён' or 'ключ администратора удалён')
+  elseif c == 'admin' and a[2] == 'stats' then
+    admin('stats', '', 0); return
   elseif c == 'admin' and ADMIN_ACTIONS[a[2] or ''] and a[3] then
     admin(a[2], a[3], tonumber(a[4])); return
   else

@@ -396,6 +396,15 @@ test('admin mutes a player; muted player is not relayed', function()
   assert(b.received() - b0 > 3000, 'unmuted player is heard again')
 end)
 
+test('admin stats: how many players use TriniVoice', function()
+  b.st.chat = {}
+  b.cmd('admin stats')
+  run(10)
+  assert(b.saw('Установили всего: 3'), 'total')
+  assert(b.saw('Сейчас онлайн: 3 (на вашем сервере SA-MP: 3)'), 'online')
+  assert(b.saw('Версии за 30 дней: 0.5.2 — 3'), 'versions')
+end)
+
 test('update notice when relay advertises a newer version', function()
   assert(updateSeen, 'relay config advertises 9.9.9') -- запомнено в первом тесте: чаты потом очищаются
 end)

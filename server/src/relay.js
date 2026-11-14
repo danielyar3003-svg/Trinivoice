@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import * as P from './protocol.js';
 import { Moderation } from './moderation.js';
+import { Stats } from './stats.js';
 
 export const DEFAULT_CONFIG = {
   allowedRooms: [],
@@ -16,7 +17,7 @@ export const DEFAULT_CONFIG = {
   reportCooldownMs: 30000,
   // администраторы ретранслятора: [{ "name": "Admin", "key": "длинный-секрет" }]
   admins: [],
-  latestClientVersion: '0.5.1',
+  latestClientVersion: '0.5.2',
   minClientVersion: '0.4.0',
   // защита от перегрузки
   maxClients: 2000,
@@ -36,13 +37,14 @@ export const DEFAULT_CONFIG = {
  * Optional hooks: onReport(record), log(text).
  */
 export class Relay {
-  constructor({ config = {}, send, now = () => Date.now(), moderation, onReport = () => {}, log = () => {} }) {
+  constructor({ config = {}, send, now = () => Date.now(), moderation, usage, onReport = () => {}, log = () => {} }) {
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.send = send;
     this.now = now;
     this.onReport = onReport;
     this.log = log;
     this.mod = moderation ?? new Moderation({ now });
+    this.usage = usage ?? new Stats({ now }); // кто подключался: ник, версия, даты (без IP)
     this.clients = new Map(); // "addr:port" -> client
     this.rooms = new Map();   // room -> Map(playerId -> client)
     this.staticBans = new Set(this.config.bannedNicks.map((n) => n.toLowerCase()));
@@ -137,6 +139,7 @@ export class Relay {
     const members = this.rooms.get(p.room);
     members.set(p.playerId, client);
 
+    this.usage.record(client.nick, client.version, client.room);
     let radioListeners = 0;
     if (client.radioFreq) for (const o of members.values()) if (o !== client && o.radioFreq === client.radioFreq) radioListeners++;
     const mutedSec = this.mod.mutedFor(client.nick);
@@ -312,6 +315,13 @@ export class Relay {
       return reply(P.NOTICE_ADMIN_DENIED, 'Неверный ключ администратора');
     }
     this.adminFailures.delete(address);
+    if (p.action === P.ADMIN_STATS) {
+      const inRoom = client ? (this.rooms.get(client.room)?.size ?? 0) : null;
+      this.usage.setOnline(this.clients.size);
+      for (const line of this.usage.summaryLines(client?.room ?? null, inRoom)) reply(P.NOTICE_ADMIN_OK, line);
+      this.log(`admin ${admin}: stats`);
+      return;
+    }
     const nick = p.nick.trim();
     if (!nick) return reply(P.NOTICE_ADMIN_DENIED, 'Не указан ник');
     const online = [...this.clients.values()].filter((c) => c.nick?.toLowerCase() === nick.toLowerCase());
@@ -365,6 +375,8 @@ export class Relay {
   /** Drop silent clients and unanswered calls. Call periodically. */
   sweep() {
     const t = this.now();
+    this.usage.setOnline(this.clients.size);
+    this.usage.maybeSave();
     for (const [ip, f] of this.adminFailures) {
       if (f.lockedUntil < t && t - f.since > this.config.adminLockMs) this.adminFailures.delete(ip);
     }
