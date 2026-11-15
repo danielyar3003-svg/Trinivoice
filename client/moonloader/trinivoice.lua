@@ -8,7 +8,7 @@
 --   audio.lua     кодеки, эффекты (рация, телефон, мегафон, стены), служебные звуки, WAV
 --   ui.lua        меню /tv на mimgui (необязательно)
 
-local SCRIPT_VERSION = '0.5.2'
+local SCRIPT_VERSION = '0.5.3'
 script_name('TriniVoice')
 script_author('TriniVoice')
 script_version(SCRIPT_VERSION)
@@ -90,6 +90,7 @@ local DEFAULTS = {
     phone_end = '',
     admin_key = '',
     dnd = false,             -- не принимать звонки
+    tg_url = 'https://t.me/trinicode', -- канал: новости и обновления
   },
   muted = {},
   volume = {},
@@ -763,7 +764,8 @@ local function onAck(p, now)
     net.latest = p.latestVersion
     if not net.updateNotified and P.compareVersions(p.latestVersion, SCRIPT_VERSION) > 0 then
       net.updateNotified = true
-      msg(('доступна новая версия %s (у вас %s)'):format(p.latestVersion, SCRIPT_VERSION))
+      msg(('доступна новая версия %s (у вас %s). Скачать в Telegram: %s — команда /tv tg'):format(
+        p.latestVersion, SCRIPT_VERSION, P.safeTelegramUrl(cfg.main.tg_url) or 't.me'))
     end
   end
 end
@@ -810,6 +812,32 @@ local function onList(p, now)
     listBuild[p.kind] = nil
     if listPrint[p.kind] then listPrint[p.kind] = nil; printList(p.kind) end
   end
+end
+
+---------------------------------------------------------------------------
+-- Telegram-канал
+---------------------------------------------------------------------------
+
+local shell32
+local function openTelegram()
+  local url = P.safeTelegramUrl(cfg.main.tg_url)
+  if not url then msg('ссылка на Telegram в настройках неверная'); return false end
+  -- ссылку всегда копируем: если игра на весь экран, браузер откроется за ней
+  pcall(setClipboardText, url)
+  if not shell32 then
+    pcall(ffi.cdef, 'void * __stdcall ShellExecuteA(void *hwnd, const char *op, const char *file, const char *params, const char *dir, int show);')
+    local ok, lib = pcall(ffi.load, 'shell32')
+    shell32 = ok and lib or false
+  end
+  local opened = false
+  if shell32 then
+    local ok, res = pcall(shell32.ShellExecuteA, nil, 'open', url, nil, nil, 1)
+    -- ShellExecute возвращает число > 32 при успехе
+    opened = ok and tonumber(ffi.cast('intptr_t', res)) > 32
+  end
+  if opened then msg('открываю Telegram: ' .. url .. ' (ссылка скопирована, сверните игру Alt+Tab)')
+  else msg('наш Telegram: ' .. url .. ' (ссылка скопирована, вставьте в браузер)') end
+  return opened
 end
 
 local function processNetwork(now)
@@ -1027,6 +1055,8 @@ local uiContext = {
   end,
   setDnd = function(on) cfg.main.dnd = on; net.lastState = 0; markDirty() end,
   startMicTest = startMicTest,
+  openTelegram = openTelegram,
+  telegramUrl = function() return P.safeTelegramUrl(cfg.main.tg_url) end,
   micTest = function()
     if not micTest then return nil end
     return { phase = micTest.phase, left = math.max(0, micTest.untilAt - os.clock()) }
@@ -1047,6 +1077,7 @@ local HELP = {
   '/tv players - все с TriniVoice на сервере, /tv freqlist - кто на моей частоте',
   '/tv dnd on | off - не принимать звонки / снова принимать',
   '/tv mictest - прослушать свой голос (4 секунды записи, потом воспроизведение)',
+  '/tv tg - открыть наш Telegram-канал (новости и обновления)',
   '/tv report ID причина - жалоба (сохраняет запись голоса)',
   '/tv codec ulaw | opus, /tv icons, /tv hud, /tv server HOST PORT',
   '/tv autocall on | off, /tv autocall start|end ШАБЛОН - звонки по сообщениям сервера',
@@ -1085,6 +1116,8 @@ local function onCommand(args)
     msg(m.radio_on and ('рация включена, частота ' .. P.freqLabel(radioWire()) .. ', клавиша ' .. keyName(m.radio_key)) or 'рация выключена')
   elseif c == 'radiopass' then
     m.radio_pass = a[2] and A.u8(a[2]) or ''; msg(a[2] and 'пароль частоты задан' or 'пароль частоты сброшен')
+  elseif c == 'tg' or c == 'telegram' then
+    openTelegram(); return
   elseif c == 'mictest' then
     startMicTest(); return
   elseif c == 'players' then

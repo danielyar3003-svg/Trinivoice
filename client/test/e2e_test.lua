@@ -121,6 +121,7 @@ local function newClient(id, nick, x, y, iniData)
   env.doesDirectoryExist = function() return true end
   env.doesFileExist = function(path) local f = io.open(path, 'rb'); if f then f:close(); return true end return false end
   env.thisScript = function() return env end
+  env.setClipboardText = function(t) st.clipboard = t end
 
   local chunk = assert(loadfile(SCRIPT))
   setfenv(chunk, env)
@@ -192,14 +193,29 @@ clients = { a, b, c }
 run(1)
 a.cmd('server 127.0.0.1 ' .. PORT)
 b.cmd('server 127.0.0.1 ' .. PORT)
+-- TV_E2E_CODEC=opus — тот же прогон с кодеком Opus (нужен libopus в LD_LIBRARY_PATH)
+if os.getenv('TV_E2E_CODEC') == 'opus' then
+  for _, cl in ipairs(clients) do cl.cmd('codec opus') end
+  assert(a.saw('кодек: Opus'), 'opus library not found for the e2e run')
+end
 
 local X, Z = 0x58, 0x5A
+local function eq2(x, y) if x ~= y then error(('expected %s, got %s'):format(tostring(y), tostring(x)), 2) end end
+-- ждать сообщения в чате до 2 сек реального времени (ответ ретранслятора приходит по UDP)
+local function waitFor(cl, text)
+  for _ = 1, 200 do
+    if cl.saw(text) then return true end
+    run(1); socket.sleep(0.008)
+  end
+  return cl.saw(text)
+end
 local function hold(cl, key, steps) cl.st.keys[key] = true; run(steps); cl.st.keys[key] = nil; run(15) end
 
 test('all clients connect to the relay', function()
   run(30)
   for _, cl in ipairs(clients) do assert(cl.saw('подключено к голосовому серверу'), cl.nick .. ' not connected') end
   updateSeen = b.saw('доступна новая версия 9.9.9') and c.saw('доступна новая версия 9.9.9')
+  updateTg = b.saw('Скачать в Telegram: https://t.me/trinicode')
 end)
 
 test('proximity: neighbour hears, far player does not', function()
@@ -297,8 +313,7 @@ end)
 test('player list: everyone with TriniVoice on this SA-MP server', function()
   a.st.chat = {}
   a.cmd('players')
-  run(10)
-  assert(a.saw('с TriniVoice на сервере: 3'), 'count')
+  assert(waitFor(a, 'с TriniVoice на сервере: 3'), 'count')
   assert(a.saw('Anna_Smirnova [2]') and a.saw('Ivan_Petrov [1]') and a.saw('Sergey_Orlov [3]'), 'names')
 end)
 
@@ -306,8 +321,7 @@ test('frequency list: who is on my frequency', function()
   a.cmd('radio 123.4'); c.cmd('radio 123.4')
   run(15)
   a.cmd('freqlist')
-  run(10)
-  assert(a.saw('на частоте 123.4: 2'), 'count on frequency')
+  assert(waitFor(a, 'на частоте 123.4: 2'), 'count on frequency')
   b.st.chat = {}
   b.cmd('freqlist')
   assert(b.saw('рация выключена'), 'no radio — no list')
@@ -324,8 +338,7 @@ test('do not disturb: nobody can call, list shows it', function()
   a.st.chat = {}
   socket.sleep(1.6) -- ретранслятор отдаёт список не чаще раза в 1.5 сек (реального времени)
   a.cmd('players')
-  run(10)
-  assert(a.saw('Sergey_Orlov [3] (без звонков)'), 'list marks the player')
+  assert(waitFor(a, 'Sergey_Orlov [3] (без звонков)'), 'list marks the player')
   c.cmd('dnd off')
   run(15)
 end)
@@ -399,10 +412,17 @@ end)
 test('admin stats: how many players use TriniVoice', function()
   b.st.chat = {}
   b.cmd('admin stats')
-  run(10)
-  assert(b.saw('Установили всего: 3'), 'total')
+  assert(waitFor(b, 'Установили всего: 3'), 'total')
   assert(b.saw('Сейчас онлайн: 3 (на вашем сервере SA-MP: 3)'), 'online')
-  assert(b.saw('Версии за 30 дней: 0.5.2 — 3'), 'versions')
+  assert(b.saw('Версии за 30 дней: ') and b.saw(' — 3'), 'versions: all 3 players on the same version')
+end)
+
+test('Telegram: /tv tg copies the link (browser opening needs Windows)', function()
+  a.st.chat = {}
+  a.cmd('tg')
+  eq2(a.st.clipboard, 'https://t.me/trinicode')
+  assert(a.saw('https://t.me/trinicode'), 'link shown in chat')
+  assert(updateTg, 'update notice points to Telegram')
 end)
 
 test('update notice when relay advertises a newer version', function()

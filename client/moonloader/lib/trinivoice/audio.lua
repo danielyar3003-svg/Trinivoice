@@ -126,7 +126,10 @@ function A.loadOpus(dir)
     int opus_decode(OpusDecoder *st, const unsigned char *data, int32_t len, int16_t *pcm, int frame_size, int decode_fec);
     void opus_decoder_destroy(OpusDecoder *st);
   ]])
-  for _, name in ipairs({ dir and (dir .. '\\lib\\opus.dll') or nil, 'opus' }) do
+  local names = {}
+  if dir then names[#names + 1] = dir .. '\\lib\\opus.dll' end
+  names[#names + 1] = 'opus'
+  for _, name in ipairs(names) do
     local ok, lib = pcall(ffi.load, name)
     if ok then opusLib = lib; break end
   end

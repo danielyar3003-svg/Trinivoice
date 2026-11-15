@@ -220,6 +220,8 @@ local function makeCtx(players)
       return { phase = k < 6 and 'rec' or 'play', left = 2.4 }
     end,
     startMicTest = function() log[#log + 1] = 'mictest'; return true end,
+    openTelegram = function() log[#log + 1] = 'telegram'; return true end,
+    telegramUrl = function() return 'https://t.me/trinicode' end,
     radioPresets = function() return frameNo % 2 == 0 and { { name = 'LSPD', freq = 911.0 }, { name = 'EMS', freq = 912.5 } } or {} end,
     players = function() return players end,
     set = function(k, v) log[#log + 1] = 'set ' .. k; cfg.main[k] = v end,
@@ -350,11 +352,12 @@ test('server list and frequency list are requested while visible', function()
     reset(); frameCb[1].cb({})
     for _, l in ipairs(log) do seen[l] = true end
     for _, c in ipairs(calls) do if c == 'Позвонить' or c:find('Позвонить', 1, true) then seen.callBtn = true end end
-    if seen.list1 and seen.list2 and seen.callBtn then break end
+    if seen.list1 and seen.list2 and seen.callBtn and seen.telegram then break end
   end
   assert(seen.list1, 'server list never requested')
   assert(seen.list2, 'frequency list never requested')
   assert(seen.callBtn, 'no call button in the server list')
+  assert(seen.telegram, 'Telegram button never clicked in 3000 random frames')
 end)
 
 test('script-side API never touches mimgui outside a frame', function()

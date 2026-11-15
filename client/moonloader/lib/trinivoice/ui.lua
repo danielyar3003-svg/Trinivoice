@@ -60,7 +60,7 @@ local C = {
   white = hex('FFFFFF'), text = hex('E9EBF2'), soft = hex('C9CCD8'), soft2 = hex('B4B8C6'),
   muted = hex('8A8FA0'), green = hex('4CD27A'), greenText = hex('7BE495'),
   orange = hex('FF9A3C'), orangeText = hex('FFB067'), red = hex('FF5A5A'), redText = hex('FF8C8C'),
-  whisper = hex('C8C8C8'),
+  whisper = hex('C8C8C8'), telegram = hex('2AABEE'),
 }
 local AVATARS = { hex('2B3A66'), hex('5A2E55'), hex('23454A'), hex('4A3A23'), hex('2F4A2B'), hex('46304F') }
 local ACCENTS = { '#6E8BFF', '#3FBF7F', '#FF8A3D', '#A57CFF' }
@@ -79,7 +79,7 @@ local FA = {
   MICROPHONE = 0xF130, MICROPHONE_SLASH = 0xF131, HOUSE = 0xF015, USERS = 0xF0C0, SLIDERS = 0xF1DE,
   WALKIE_TALKIE = 0xF2CE, SERVER = 0xF233, EAR_LISTEN = 0xF2A2, COMMENT = 0xF075, VOLUME_HIGH = 0xF028,
   BULLHORN = 0xF0A1, KEYBOARD = 0xF11C, ARROWS_ROTATE = 0xF021, VOLUME_XMARK = 0xF026,
-  MAGNIFYING_GLASS = 0xF002, XMARK = 0xF00D, PHONE = 0xF095, FLAG = 0xF024,
+  MAGNIFYING_GLASS = 0xF002, XMARK = 0xF00D, PHONE = 0xF095, FLAG = 0xF024, TELEGRAM = 0xF2C6,
 }
 local function utf8char(cp)
   return string.char(0xE0 + bit.rshift(cp, 12), 0x80 + bit.band(bit.rshift(cp, 6), 0x3F), 0x80 + bit.band(cp, 0x3F))
@@ -327,6 +327,18 @@ local function drawSidebar(st, playerCount)
       rect(x + w - bw - 8, y + 10, bw, 20, active and acc or C.border, 10)
       text(x + w - bw - 8 + (bw - sz.x) / 2, y + 10 + (20 - sz.y) / 2, s, C.white, fonts.small)
     end
+  end
+
+  -- наш Telegram (всегда виден)
+  do
+    local x, y, w, h = 14, 74 + #PAGES * 46 + 6, SIDE - 28, 34
+    local clicked, hov = hit('##telegram', x, y, w, h)
+    rect(x, y, w, h, alpha(C.telegram, hov and 0.28 or 0.16), 10)
+    local tx = x + 12
+    local ti = icon('TELEGRAM')
+    if ti ~= '' then textMid(tx, y, h, ti, C.telegram); tx = tx + 26 end
+    textMid(tx, y, h, 'Наш Telegram', C.white, fonts.bold)
+    if clicked then ctx.openTelegram() end
   end
 
   -- звонок
@@ -932,9 +944,12 @@ local function pageServer(st)
     text(X0 + CW - 16 - sz.x, ry, r[2], r[3], fonts.bold)
     if i < #rows then rect(X0 + 16, ry + 22, CW - 32, 1, C.border) end
   end
-  local note = st.updateAvailable and ('Доступна версия ' .. st.latest .. ': скачайте её у владельца ретранслятора.')
-    or 'Адрес ретранслятора выдаёт его владелец. Настройки сохраняются в trinivoice.ini.'
-  text(X0, y + 264, note, st.updateAvailable and C.orangeText or C.muted, fonts.small)
+  local note = st.updateAvailable and ('Доступна версия ' .. st.latest .. ' — скачайте в нашем Telegram.')
+    or 'Новости и обновления — в нашем Telegram.'
+  textMid(X0, y + 262, 34, note, st.updateAvailable and C.orangeText or C.muted, fonts.small)
+  local ti = icon('TELEGRAM')
+  local blabel = (ti ~= '' and (ti .. '  ') or '') .. (st.updateAvailable and 'Скачать обновление' or 'Наш Telegram')
+  if button('##tgServer', X0 + CW - 200, y + 262, 200, 34, blabel, st.updateAvailable) then ctx.openTelegram() end
 end
 
 ---------------------------------------------------------------------------

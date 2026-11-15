@@ -247,5 +247,43 @@ test('resample keeps duration and shape', function()
   local same, sn = A.resample(src, 441, 8000, 8000); eq(sn, 441); eq(same[100], src[100])
 end)
 
+test('only https://t.me links can be opened', function()
+  eq(P.safeTelegramUrl('https://t.me/trinicode'), 'https://t.me/trinicode')
+  eq(P.safeTelegramUrl('https://t.me/trinicode/15'), 'https://t.me/trinicode/15')
+  for _, bad in ipairs({ 'http://t.me/trinicode', 'https://t.me.evil.com/x', 'https://t.me/a b', 'file:///C:/Windows/calc.exe',
+      'https://t.me/x?y=1', 'calc.exe', 'https://t.me/', 'https://t.me/x" & calc', '' }) do
+    eq(P.safeTelegramUrl(bad), nil, bad)
+  end
+end)
+
+-- Opus: проверяется, если библиотека доступна (LD_LIBRARY_PATH=.../libopus.so).
+-- На Windows скрипт берёт moonloader/lib/opus.dll, собранный из тех же исходников.
+do
+  local lib = A.loadOpus(nil)
+  if lib then
+    test('opus codec: encode, decode, packet loss concealment', function()
+      local c = assert(A.makeOpus(lib, 24000), 'encoder')
+      eq(c.rate, 16000); eq(c.frame, 320)
+      local dec = c.newDecoder()
+      local src = ffi.new('int16_t[320]')
+      local total, frames = 0, 0
+      for f = 1, 10 do
+        for i = 0, 319 do src[i] = math.floor(math.sin((f * 320 + i) * 2 * math.pi * 440 / 16000) * 10000) end
+        local payload = assert(c.encode(src, 320), 'encode')
+        assert(#payload > 5 and #payload < 200, 'payload size ' .. #payload)
+        local pcm, n = dec:decode(payload)
+        eq(n, 320)
+        if f > 3 then for i = 0, 319 do total = total + math.abs(pcm[i]) end; frames = frames + 1 end
+      end
+      assert(total / (frames * 320) > 3000, 'decoded signal has energy')
+      local pcm, n = dec:conceal()
+      eq(n, 320)
+      assert(pcm ~= nil)
+    end)
+  else
+    print('skip opus codec: library not found')
+  end
+end
+
 print(('%d passed, %d failed'):format(passed, failed))
 os.exit(failed == 0 and 0 or 1)

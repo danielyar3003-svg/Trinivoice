@@ -134,6 +134,14 @@ function P.cleanText(s, limit)
   return s
 end
 
+-- Ссылка на Telegram, которую скрипт согласен открыть: только https://t.me/<имя>[/<число>].
+-- Всё остальное отвергается — через настройки нельзя подсунуть игроку чужую программу или сайт.
+function P.safeTelegramUrl(url)
+  url = tostring(url or '')
+  if url:match('^https://t%.me/[%w_]+$') or url:match('^https://t%.me/[%w_]+/%d+$') then return url end
+  return nil
+end
+
 -- Ник SA-MP: только разрешённые сервером символы (и безопасно для имени файла).
 function P.cleanNick(s)
   return (tostring(s or ''):gsub('[^%w%[%]%(%)%$@%._=]', '')):sub(1, 24)
