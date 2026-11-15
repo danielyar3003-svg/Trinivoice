@@ -8,7 +8,7 @@
 --   audio.lua     кодеки, эффекты (рация, телефон, мегафон, стены), служебные звуки, WAV
 --   ui.lua        меню /tv на mimgui (необязательно)
 
-local SCRIPT_VERSION = '0.5.4'
+local SCRIPT_VERSION = '0.5.5'
 script_name('TriniVoice')
 script_author('TriniVoice')
 script_version(SCRIPT_VERSION)
@@ -89,6 +89,8 @@ local DEFAULTS = {
     phone_end = '',
     admin_key = '',
     dnd = false,             -- не принимать звонки
+    mic_ready = true,        -- микрофон открыт всё время (звук уходит только при нажатии):
+                             -- без этого запуск записи на каждое нажатие даёт микрофриз
     tg_url = 'https://t.me/trinicode', -- канал: новости и обновления
   },
   muted = {},
@@ -362,12 +364,13 @@ local function wantedMode()
   return m.mode, keyed
 end
 
+local junkBuf, junkSize = nil, 0
 local function drainRecording()
   if not rec then return end
   local avail = bass.BASS_ChannelGetData(rec, nil, 0)
   if avail > 0 and avail ~= 0xFFFFFFFF then
-    local junk = ffi.new('uint8_t[?]', avail)
-    bass.BASS_ChannelGetData(rec, junk, avail)
+    if avail > junkSize then junkSize = avail; junkBuf = ffi.new('uint8_t[?]', avail) end
+    bass.BASS_ChannelGetData(rec, junkBuf, avail)
   end
 end
 
@@ -385,7 +388,11 @@ local function processCapture(now)
   tx.mode = mode
 
   -- пока открыто меню, микрофон пишется для индикатора, но в эфир не идёт
+  -- Запуск/остановка устройства записи на каждое нажатие у части микрофонов и драйверов
+  -- подвешивает игру на десятки–сотни мс. Поэтому по умолчанию запись идёт всё время,
+  -- пока чат включён, а звук уходит в эфир только при нажатии (как в Discord).
   local wantRecord = mode ~= nil or tx.monitor or (micTest ~= nil and micTest.phase == 'rec')
+    or (cfg.main.mic_ready and cfg.main.enabled)
   if wantRecord and not tx.recording then
     drainRecording()
     bass.BASS_ChannelPlay(rec, 0)
@@ -1079,6 +1086,7 @@ local HELP = {
   '/tv players - все с TriniVoice на сервере, /tv freqlist - кто на моей частоте',
   '/tv dnd on | off - не принимать звонки / снова принимать',
   '/tv mictest - прослушать свой голос (4 секунды записи, потом воспроизведение)',
+  '/tv micready on | off - держать микрофон готовым (без фриза при нажатии) / включать только при нажатии',
   '/tv tg - открыть наш Telegram-канал (новости и обновления)',
   '/tv report ID причина - жалоба (сохраняет запись голоса)',
   '/tv codec ulaw | opus, /tv icons, /tv hud, /tv server HOST PORT',
@@ -1120,6 +1128,10 @@ local function onCommand(args)
     m.radio_pass = a[2] and A.u8(a[2]) or ''; msg(a[2] and 'пароль частоты задан' or 'пароль частоты сброшен')
   elseif c == 'tg' or c == 'telegram' then
     openTelegram(); return
+  elseif c == 'micready' and (a[2] == 'on' or a[2] == 'off') then
+    m.mic_ready = a[2] == 'on'
+    msg(m.mic_ready and 'микрофон всегда готов: нажатие клавиши без задержки'
+      or 'микрофон включается только на время нажатия (на некоторых микрофонах — микрофриз)')
   elseif c == 'mictest' then
     startMicTest(); return
   elseif c == 'players' then
@@ -1209,6 +1221,9 @@ function main()
   ok, err = startRecording()
   if not ok then msg(err .. ', вы будете только слышать других') end
   openSocket()
+  -- звуки готовим заранее, а не при первом нажатии клавиши
+  soundsFor(LOCAL_RATE)
+  soundsFor(codec.rate)
   font = renderCreateFont('Arial', 9, 5)
   sampRegisterChatCommand('tv', onCommand)
   if ui then ui.init(uiContext) end

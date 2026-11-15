@@ -43,8 +43,8 @@ local function newClient(id, nick, x, y, iniData)
       recAvail = recAvail - n
       return n
     end,
-    BASS_ChannelPlay = function(h) if h == 100 then recOn = true end return 1 end,
-    BASS_ChannelPause = function(h) if h == 100 then recOn = false end return 1 end,
+    BASS_ChannelPlay = function(h) if h == 100 then recOn = true; st.recStarts = (st.recStarts or 0) + 1 end return 1 end,
+    BASS_ChannelPause = function(h) if h == 100 then recOn = false; st.recStops = (st.recStops or 0) + 1 end return 1 end,
     BASS_ChannelStop = function(h) if h == 100 then recOn = false end return 1 end,
     BASS_StreamCreate = function() nextH = nextH + 1; st.put[nextH] = 0; st.fx = st.fx or nextH; return nextH end,
     BASS_StreamPutData = function(h, buf, len) if buf ~= nil then st.put[h] = (st.put[h] or 0) + len end return 0 end,
@@ -224,6 +224,26 @@ test('B and other keys do nothing: only the talk and radio keys are bound', func
   run(3)
   assert(not a.saw('режим:'), 'B must not switch the voice range any more')
   assert(not a.saw('загружен'), 'nothing else happened')
+end)
+
+test('pressing the talk key does not restart the microphone (no micro-freeze)', function()
+  run(5)
+  local starts, stops = a.st.recStarts or 0, a.st.recStops or 0
+  local b0 = b.received()
+  run(50) -- микрофон открыт, но клавиша не нажата
+  assert(b.received() == b0, 'open microphone sends nothing until the key is pressed')
+  for _ = 1, 5 do hold(a, X, 3) end
+  eq2(a.st.recStarts or 0, starts) -- устройство записи не перезапускалось
+  eq2(a.st.recStops or 0, stops)
+  assert(b.received() > b0, 'but the presses were heard')
+  -- старое поведение по желанию: запись только на время нажатия
+  a.cmd('micready off')
+  run(3)
+  local s2 = a.st.recStarts or 0
+  for _ = 1, 3 do hold(a, X, 3) end
+  assert((a.st.recStarts or 0) - s2 == 3, 'micready off: the device starts on each press')
+  a.cmd('micready on')
+  run(3)
 end)
 
 test('proximity: neighbour hears, far player does not', function()

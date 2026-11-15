@@ -728,13 +728,14 @@ local function pageSound(st)
   local lsz = textSize(label, fonts.small)
   text(mx + hw - 16 - lsz.x, y + 17, label, col, fonts.small)
   drawMeter(mx + 16, y + 44, hw - 32, 40, st)
-  text(mx + 16, y + 100, 'Порог', C.soft)
+  text(mx + 16, y + 92, 'Порог', C.soft)
   local tv = tostring(m.vad_threshold)
   local tsz = textSize(tv, fonts.bold)
-  text(mx + hw - 16 - tsz.x, y + 100, tv, C.white, fonts.bold)
-  local nt = slider('##vad', mx + 16, y + 134, hw - 32, m.vad_threshold, 50, 5000)
+  text(mx + hw - 16 - tsz.x, y + 92, tv, C.white, fonts.bold)
+  local nt = slider('##vad', mx + 16, y + 118, hw - 32, m.vad_threshold, 50, 5000)
   if nt then ctx.set('vad_threshold', nt) end
-  text(mx + 16, y + 150, 'оранжевая линия на шкале — порог', C.muted, fonts.small)
+  textMid(mx + 16, y + 142, 26, 'Микрофон всегда готов', C.soft)
+  if toggle('##micReady', mx + hw - 16 - 46, y + 142, m.mic_ready) then ctx.set('mic_ready', not m.mic_ready) end
 
   y = 276
   card(X0, y, hw, 164)
