@@ -8,7 +8,7 @@
 --   audio.lua     кодеки, эффекты (рация, телефон, мегафон, стены), служебные звуки, WAV
 --   ui.lua        меню /tv на mimgui (необязательно)
 
-local SCRIPT_VERSION = '0.5.3'
+local SCRIPT_VERSION = '0.5.4'
 script_name('TriniVoice')
 script_author('TriniVoice')
 script_version(SCRIPT_VERSION)
@@ -62,7 +62,6 @@ local DEFAULTS = {
     port = 7790,
     activation = 'ptt',      -- ptt | vad
     ptt_key = 0x58,          -- X
-    mode_key = 0x42,         -- B: шёпот / обычный / крик
     mode = 2,
     vad_threshold = 700,
     mic_gain = 100,          -- %
@@ -115,6 +114,9 @@ local function loadConfig()
   return c
 end
 local cfg = loadConfig()
+-- клавиши переключения дальности больше нет (только клавиши разговора и рации):
+-- убираем старую настройку из ini
+cfg.main.mode_key = nil
 
 local function save() inicfg.save(cfg, INI) end
 local function msg(text) sampAddChatMessage('[TriniVoice] {FFFFFF}' .. cp(text), 0x5BD75B) end
@@ -1070,7 +1072,7 @@ local uiContext = {
 local HELP = {
   '/tv - меню (без mimgui: состояние и справка), /tv help - справка',
   '/tv on | off - включить или выключить голосовой чат',
-  '/tv mode 1-3 - шёпот, обычный, крик; /tv ptt | vad - клавиша или голос',
+  '/tv mode 1-3 - шёпот, обычный, крик (или плитки в меню); /tv ptt | vad - клавиша или голос',
   '/tv radio on | off | ЧАСТОТА - рация (например /tv radio 911.0), /tv radiopass ПАРОЛЬ',
   '/tv call ID - позвонить, /tv accept - ответить, /tv decline | hangup - сбросить',
   '/tv mute ID | unmute ID, /tv vol ID 0-200, /tv master 0-100, /tv gain 50-400',
@@ -1182,12 +1184,8 @@ end
 -- Точка входа
 ---------------------------------------------------------------------------
 
+-- Своих клавиш у скрипта две: разговор (ptt_key) и рация (radio_key), обе меняются в меню.
 local function processKeys()
-  if cfg.main.mode_key ~= 0 and wasKeyPressed(cfg.main.mode_key) and not inputBusy() then
-    cfg.main.mode = cfg.main.mode % 3 + 1
-    if not (ui and ui.isOpen()) then msg('режим: ' .. MODE_NAME[cfg.main.mode]) end
-    markDirty()
-  end
   -- переназначение клавиши из меню: ловим следующую нажатую (кроме ЛКМ/ПКМ и Esc)
   if bindTarget then
     for k = 3, 254 do
@@ -1214,8 +1212,8 @@ function main()
   font = renderCreateFont('Arial', 9, 5)
   sampRegisterChatCommand('tv', onCommand)
   if ui then ui.init(uiContext) end
-  msg(('v%s загружен. %s - говорить, %s - дальность, /tv - %s'):format(SCRIPT_VERSION,
-    keyName(cfg.main.ptt_key), keyName(cfg.main.mode_key), ui and 'меню' or 'настройки'))
+  msg(('v%s загружен. %s - говорить, %s - рация, /tv - %s'):format(SCRIPT_VERSION,
+    keyName(cfg.main.ptt_key), keyName(cfg.main.radio_key), ui and 'меню' or 'настройки'))
 
   while true do
     wait(0)

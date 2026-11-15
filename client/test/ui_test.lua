@@ -173,7 +173,7 @@ end
 
 local function makeCtx(players)
   local log = {}
-  local cfg = { main = { enabled = true, mode = 2, activation = 'ptt', ptt_key = 0x58, mode_key = 0x42,
+  local cfg = { main = { enabled = true, mode = 2, activation = 'ptt', ptt_key = 0x58,
     mic_gain = 150, master_volume = 80, vad_threshold = 700, codec = 'ulaw', show_icons = true,
     show_hud = true, accent = '#6E8BFF', host = '1.2.3.4', port = 7790, radio_on = true, radio_freq = 911.0,
     radio_pass = '', radio_key = 0x5A, radio_volume = 90, occlusion = true, fx_radio = true, megaphone = true,
@@ -233,8 +233,8 @@ local function makeCtx(players)
     toggleMute = function(n) assert(type(n) == 'string') end,
     setVolume = function(n, v) assert(type(n) == 'string' and v >= 0 and v <= 200, 'volume ' .. v) end,
     binding = function() return nil end,
-    startBinding = function(w) assert(w == 'ptt' or w == 'mode' or w == 'radio') end,
-    keyName = function(k) return k == 0x58 and 'X' or 'B' end,
+    startBinding = function(w) assert(w == 'ptt' or w == 'radio', 'only talk and radio keys can be bound: ' .. tostring(w)) end,
+    keyName = function(k) return k == 0x58 and 'X' or 'Z' end,
   }
   return ctx, log
 end

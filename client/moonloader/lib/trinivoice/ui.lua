@@ -459,7 +459,7 @@ local function pageHome(st)
   local bind = ctx.binding()
   local rows = {
     { 'KEYBOARD', 'Говорить', 'ptt', m.ptt_key },
-    { 'ARROWS_ROTATE', 'Сменить дальность', 'mode', m.mode_key },
+    { 'WALKIE_TALKIE', 'Говорить в рацию', 'radio', m.radio_key },
   }
   for i, r in ipairs(rows) do
     local ry = y + 96 + (i - 1) * 42

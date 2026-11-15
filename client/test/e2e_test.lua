@@ -218,6 +218,14 @@ test('all clients connect to the relay', function()
   updateTg = b.saw('Скачать в Telegram: https://t.me/trinicode')
 end)
 
+test('B and other keys do nothing: only the talk and radio keys are bound', function()
+  a.st.chat = {}
+  for _, k in ipairs({ 0x42, 0x4D, 0x4E }) do a.st.pressed[k] = true; a.step() end -- B, M, N
+  run(3)
+  assert(not a.saw('режим:'), 'B must not switch the voice range any more')
+  assert(not a.saw('загружен'), 'nothing else happened')
+end)
+
 test('proximity: neighbour hears, far player does not', function()
   local b0, c0 = b.received(), c.received()
   hold(a, X, 25)
