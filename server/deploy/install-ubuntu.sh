@@ -57,7 +57,14 @@ if [[ ! -f /etc/trinivoice/config.json ]]; then
   echo "  $KEY"
   echo
 else
-  echo "  /etc/trinivoice/config.json уже есть — оставляю как есть"
+  # остальные настройки не трогаем, только номер свежей версии для уведомлений игрокам
+  node -e '
+    const fs = require("fs"), f = "/etc/trinivoice/config.json";
+    const c = JSON.parse(fs.readFileSync(f, "utf8"));
+    c.latestClientVersion = JSON.parse(fs.readFileSync(process.argv[1], "utf8")).latestClientVersion;
+    fs.writeFileSync(f, JSON.stringify(c, null, 2) + "\n");
+    console.log("  /etc/trinivoice/config.json уже есть — оставляю настройки, свежая версия клиента: " + c.latestClientVersion);
+  ' "$SRC/config.example.json"
 fi
 
 echo "== 5/7 Брандмауэр: открыть UDP $PORT"

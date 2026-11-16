@@ -8,7 +8,7 @@
 --   audio.lua     кодеки, эффекты (рация, телефон, мегафон, стены), служебные звуки, WAV
 --   ui.lua        меню /tv на mimgui (необязательно)
 
-local SCRIPT_VERSION = '0.5.5'
+local SCRIPT_VERSION = '0.5.6'
 script_name('TriniVoice')
 script_author('TriniVoice')
 script_version(SCRIPT_VERSION)
@@ -127,7 +127,9 @@ local bass, rec, pushProc, fxStream
 local codec, codecs = nil, {}
 local udp
 local net = { seq = 0, lastState = 0, lastAck = -100, status = 0, online = 0, room = nil, ping = 0,
-  stateAt = nil, radioListeners = 0, mutedSec = 0, latest = '', updateNotified = false }
+  stateAt = nil, radioListeners = 0, mutedSec = 0, latest = '', updateNotified = false,
+  -- диагностика (/tv diag) и автопереподключение
+  wasConnected = false, openedAt = 0, sentAt = -100, sendingSince = 0, reopens = 0, tokens = 0, rx = 0, tx = 0, lastStatus = nil }
 local speakers = {}
 local tx = { active = false, mode = nil, vadUntil = 0, level = 0, monitor = false, recording = false }
 local call                  -- { state = 'in'|'out'|'active', peerId, peerNick, since }
@@ -274,9 +276,10 @@ local function openSocket()
   local ok, err = udp:setpeername(cfg.main.host, cfg.main.port)
   if not ok then msg('не удалось подключиться к ' .. cfg.main.host .. ': ' .. tostring(err)); udp = nil end
   net.lastAck = -100
+  net.openedAt = os.clock()
 end
 
-local function sendPacket(data) if udp then udp:send(data) end end
+local function sendPacket(data) if udp then net.tx = net.tx + 1; udp:send(data) end end
 
 -- Комната = адрес SA-MP сервера. Домен переводим в IP, чтобы игроки,
 -- зашедшие по домену и по IP, попали в одну комнату.
@@ -755,6 +758,7 @@ end
 ---------------------------------------------------------------------------
 
 local function onAck(p, now)
+  net.lastStatus = p.status
   if p.status ~= net.status then
     if ACK_TEXT[p.status] then msg(ACK_TEXT[p.status]) end
     if p.status == P.ACK_MUTED then
@@ -854,6 +858,7 @@ local function processNetwork(now)
   for _ = 1, 300 do
     local data = udp:receive()
     if not data then break end
+    net.rx = net.rx + 1
     local p = P.parseServer(data)
     if p then
       if p.type == P.S_ACK then onAck(p, now)
@@ -863,6 +868,7 @@ local function processNetwork(now)
       elseif p.type == P.S_LIST then onList(p, now)
       elseif p.type == P.S_TOKEN then
         P.setToken(p.token)
+        net.tokens = net.tokens + 1
         net.lastState = 0 -- сразу повторить STATE уже с токеном
       end
     end
@@ -882,6 +888,25 @@ local function processNetwork(now)
         flags = cfg.main.dnd and P.FLAG_DND or 0,
       }))
       net.stateAt = net.stateAt or now
+      if now - net.sentAt > 1 then net.sendingSince = now end -- после смерти/загрузки отсчёт заново
+      net.sentAt = now
+    end
+  end
+
+  -- Сторож связи: сообщаем о потере и пересоздаём сокет. Если роутер/провайдер
+  -- сменил внешний порт или «забыл» UDP-сессию, новый сокет восстанавливает связь,
+  -- а ретранслятор переносит на новый адрес нашу сессию (звонок, рация).
+  local connected = isConnected(now)
+  if connected then
+    net.wasConnected = true
+  elseif cfg.main.enabled and sampIsLocalPlayerSpawned() then
+    if net.wasConnected and now - net.sendingSince > 3 then
+      net.wasConnected = false
+      msg('связь с голосовым сервером потеряна, переподключаюсь... (подробности: /tv diag)')
+    end
+    if now - net.lastAck > 6 and now - net.openedAt > 6 then
+      net.reopens = net.reopens + 1
+      openSocket()
     end
   end
 end
@@ -1088,6 +1113,7 @@ local HELP = {
   '/tv mictest - прослушать свой голос (4 секунды записи, потом воспроизведение)',
   '/tv micready on | off - держать микрофон готовым (без фриза при нажатии) / включать только при нажатии',
   '/tv tg - открыть наш Telegram-канал (новости и обновления)',
+  '/tv diag - диагностика связи (пришлите скрин админу, если голос отключается)',
   '/tv report ID причина - жалоба (сохраняет запись голоса)',
   '/tv codec ulaw | opus, /tv icons, /tv hud, /tv server HOST PORT',
   '/tv autocall on | off, /tv autocall start|end ШАБЛОН - звонки по сообщениям сервера',
@@ -1132,6 +1158,17 @@ local function onCommand(args)
     m.mic_ready = a[2] == 'on'
     msg(m.mic_ready and 'микрофон всегда готов: нажатие клавиши без задержки'
       or 'микрофон включается только на время нажатия (на некоторых микрофонах — микрофриз)')
+  elseif c == 'diag' then
+    local now = os.clock()
+    msg(('диагностика v%s: %s:%d, комната %s'):format(SCRIPT_VERSION, m.host, m.port, tostring(net.room)))
+    msg(('связь: %s, последний ответ %s назад, пинг %d мс, статус %s'):format(
+      isConnected(now) and 'есть' or 'НЕТ',
+      net.lastAck < 0 and 'никогда' or ('%.1f с'):format(now - net.lastAck), net.ping,
+      net.lastStatus == nil and 'нет ответов' or net.lastStatus == P.ACK_OK and 'OK'
+        or ACK_TEXT[net.lastStatus] or ('код ' .. net.lastStatus)))
+    msg(('пакетов: отправлено %d, получено %d, токенов %d, переподключений %d, игра: %s'):format(
+      net.tx, net.rx, net.tokens, net.reopens, sampIsLocalPlayerSpawned() and 'заспавнен' or 'НЕ заспавнен'))
+    if net.rx == 0 then msg('ответов от сервера нет: проверьте адрес /tv server, фаервол/антивирус и VPN') end
   elseif c == 'mictest' then
     startMicTest(); return
   elseif c == 'players' then

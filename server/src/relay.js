@@ -17,7 +17,7 @@ export const DEFAULT_CONFIG = {
   reportCooldownMs: 30000,
   // администраторы ретранслятора: [{ "name": "Admin", "key": "длинный-секрет" }]
   admins: [],
-  latestClientVersion: '0.5.5',
+  latestClientVersion: '0.5.6',
   minClientVersion: '0.4.0',
   // защита от перегрузки
   maxClients: 2000,
@@ -28,6 +28,9 @@ export const DEFAULT_CONFIG = {
   adminLockMs: 15 * 60000,
   // как часто клиент может запрашивать список игроков (каждый вид отдельно)
   listCooldownMs: 1500,
+  // если у игрока сменился внешний порт/IP (NAT, мобильный интернет), тот же ник
+  // забирает свой ID сразу с того же IP или через столько мс тишины старого адреса
+  takeoverMs: 1500,
 };
 
 /**
@@ -119,7 +122,20 @@ export class Relay {
     const t = this.now();
     let client = this.clients.get(key);
     const holder = this.rooms.get(p.room)?.get(p.playerId);
-    if (holder && holder !== client) return this.#ack(address, port, P.ACK_ID_TAKEN, { online: this.rooms.get(p.room).size });
+    if (holder && holder !== client) {
+      // Тот же игрок с нового адреса (роутер сменил порт) — переносим сессию,
+      // сохраняя звонок и рацию. Чужой ник или живой старый адрес с другого IP — отказ.
+      const sameNick = holder.nick.toLowerCase() === p.nick.toLowerCase();
+      if (!sameNick || (holder.address !== address && t - holder.seenAt < this.config.takeoverMs)) {
+        return this.#ack(address, port, P.ACK_ID_TAKEN, { online: this.rooms.get(p.room).size });
+      }
+      if (holder.address !== address && (this.perIp.get(address) ?? 0) >= this.config.maxClientsPerIp) {
+        return this.#ack(address, port, P.ACK_FULL);
+      }
+      if (client) this.#remove(client);
+      this.#rebind(holder, key, address, port);
+      client = holder;
+    }
     if (client && (client.room !== p.room || client.playerId !== p.playerId)) this.#detach(client);
     if (!client) {
       if (this.clients.size >= this.config.maxClients || (this.perIp.get(address) ?? 0) >= this.config.maxClientsPerIp) {
@@ -362,6 +378,16 @@ export class Relay {
       members.delete(client.playerId);
       if (members.size === 0) this.rooms.delete(client.room);
     }
+  }
+
+  #rebind(client, key, address, port) {
+    this.log(`rebind ${client.nick}[${client.playerId}] ${client.address}:${client.port} -> ${address}:${port}`);
+    this.clients.delete(client.key);
+    const n = (this.perIp.get(client.address) ?? 1) - 1;
+    if (n > 0) this.perIp.set(client.address, n); else this.perIp.delete(client.address);
+    Object.assign(client, { key, address, port });
+    this.clients.set(key, client);
+    this.perIp.set(address, (this.perIp.get(address) ?? 0) + 1);
   }
 
   #remove(client) {

@@ -69,6 +69,20 @@ local function newClient(id, nick, x, y, iniData)
     elseif name == 'vkeys' then return vkeysStub
     elseif name == 'lib.samp.events' then return sampevStub
     elseif name == 'trinivoice.ui' then error('mimgui not installed')
+    elseif name == 'socket' then
+      -- обёртка UDP: тест может «убить» текущие сокеты, как роутер, забывший UDP-сессию
+      st.sockets = st.sockets or {}
+      return setmetatable({ udp = function()
+        local real, dead = socket.udp(), false
+        st.sockets[#st.sockets + 1] = function() dead = true end
+        return {
+          settimeout = function(_, ...) return real:settimeout(...) end,
+          setpeername = function(_, ...) return real:setpeername(...) end,
+          send = function(_, d) if dead then return #d end return real:send(d) end,
+          receive = function() if dead then real:receive(); return nil end return real:receive() end,
+          close = function() return real:close() end,
+        }
+      end }, { __index = socket })
     elseif name == 'trinivoice.protocol' then
       -- в MoonLoader у каждого скрипта свой Lua-state: свой модуль и свой токен
       st.protocol = st.protocol or dofile(here .. '/../moonloader/lib/trinivoice/protocol.lua')
@@ -435,6 +449,21 @@ test('admin mutes a player; muted player is not relayed', function()
   b0 = b.received()
   hold(a, X, 25)
   assert(b.received() - b0 > 3000, 'unmuted player is heard again')
+end)
+
+test('router forgets the UDP session: script notices, reconnects and keeps working', function()
+  a.st.chat = {}
+  for _, kill in ipairs(a.st.sockets) do kill() end
+  run(400) -- 8 секунд игрового времени без ответов
+  assert(a.saw('связь с голосовым сервером потеряна'), 'loss reported')
+  assert(waitFor(a, 'подключено к голосовому серверу'), 'reconnected through a new socket')
+  assert(not a.saw('ваш ID уже занят'), 'relay moved the session to the new port at once')
+  a.cmd('diag')
+  assert(a.saw('переподключений 1'), 'diag shows the reconnect')
+  assert(a.saw('связь: есть'), 'diag shows the link is up')
+  local b0 = b.received()
+  hold(a, X, 25)
+  assert(b.received() - b0 > 3000, 'neighbour hears the player again')
 end)
 
 test('admin stats: how many players use TriniVoice', function()

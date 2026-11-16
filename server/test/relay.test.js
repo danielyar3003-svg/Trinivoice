@@ -55,7 +55,7 @@ test('proximity voice goes only to nearby players, ack carries online count and 
   join(relay, 'b', 2, 10, 0);
   join(relay, 'c', 3, 200, 0);
   const ack = of(sent, P.S_ACK).at(-1).pkt;
-  assert.equal(ack.status, P.ACK_OK); assert.equal(ack.online, 3); assert.equal(ack.latestVersion, '0.5.5');
+  assert.equal(ack.status, P.ACK_OK); assert.equal(ack.online, 3); assert.equal(ack.latestVersion, '0.5.6');
   clear();
   speak(relay, 'a');
   assert.deepEqual(voiceTo(sent), ['b:1/0']);
@@ -379,4 +379,32 @@ test('radio list: only players on my frequency, only if I am on it', () => {
   clear();
   relay.handle(P.encodeListRequest(P.LIST_RADIO), 'e', 1);
   assert.equal(of(sent, P.S_LIST)[0].pkt.total, 0, 'wrong password — cannot see who is on a locked frequency');
+});
+
+test('same player from a new port/IP takes over the session (NAT rebinding) and keeps the call', () => {
+  const { relay, sent, clear, tick } = setup();
+  join(relay, 'a', 1, 0, 0);
+  join(relay, 'b', 2, 10, 0);
+  relay.handle(P.encodeClientCall(P.CALL_INVITE, 2), 'a', 1);
+  relay.handle(P.encodeClientCall(P.CALL_ACCEPT, 0), 'b', 1);
+  clear();
+  // роутер игрока 1 сменил внешний порт: тот же IP, новый порт — сразу переносим
+  relay.handle(P.encodeState({ playerId: 1, x: 0, y: 0, z: 10, room: ROOM, nick: 'Nick_1' }), 'a', 2);
+  assert.equal(of(sent, P.S_ACK).at(-1).pkt.status, P.ACK_OK);
+  assert.equal(of(sent, P.S_ACK).at(-1).to, 'a:2');
+  assert.equal(relay.clients.size, 2);
+  clear();
+  relay.handle(P.encodeClientVoice(1, P.MODE_PHONE, P.CODEC_ULAW, Buffer.alloc(160, 0x7f)), 'a', 2);
+  assert.deepEqual(voiceTo(sent).filter((v) => v.endsWith('/2')), ['b:1/2'], 'call survives the port change');
+  // чужой ник не может занять ID
+  relay.handle(P.encodeState({ playerId: 1, x: 0, y: 0, z: 10, room: ROOM, nick: 'Other' }), 'a', 3);
+  assert.equal(of(sent, P.S_ACK).at(-1).pkt.status, P.ACK_ID_TAKEN);
+  // новый IP: пока старый адрес жив — отказ, после тишины — перенос
+  relay.handle(P.encodeState({ playerId: 1, x: 0, y: 0, z: 10, room: ROOM, nick: 'Nick_1' }), 'z', 1);
+  assert.equal(of(sent, P.S_ACK).at(-1).pkt.status, P.ACK_ID_TAKEN);
+  tick(2000);
+  relay.handle(P.encodeState({ playerId: 1, x: 0, y: 0, z: 10, room: ROOM, nick: 'Nick_1' }), 'z', 1);
+  assert.equal(of(sent, P.S_ACK).at(-1).pkt.status, P.ACK_OK);
+  assert.equal(relay.clients.size, 2);
+  assert.equal(relay.perIp.get('a'), undefined); assert.equal(relay.perIp.get('z'), 1);
 });
