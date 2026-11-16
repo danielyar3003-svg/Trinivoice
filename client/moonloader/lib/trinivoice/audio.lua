@@ -181,10 +181,13 @@ end
 ---------------------------------------------------------------------------
 
 -- Полная громкость в первой четверти радиуса, дальше линейно до нуля на границе.
+-- Полная громкость до 40% дальности, дальше плавный спад (громко держится дольше,
+-- у края слышно тихо, за дальностью — тишина).
 function A.distanceVolume(d, range)
-  local full = range * 0.25
+  local full = range * 0.4
   if d <= full then return 1 end
-  return clamp(1 - (d - full) / (range - full), 0, 1)
+  local t = clamp((d - full) / (range - full), 0, 1)
+  return 1 - t * t * (3 - 2 * t)
 end
 
 -- Панорама: -1 слева, 1 справа, относительно направления камеры (fx, fy).
@@ -198,15 +201,9 @@ function A.stereoPan(mx, my, sx, sy, fx, fy)
 end
 
 function A.applyGainAndRms(buf, count, gain)
+  if gain ~= 1 then A.applyGain(buf, count, gain) end -- мягкое ограничение вместо хрипа
   local sum = 0
-  for i = 0, count - 1 do
-    local v = buf[i]
-    if gain ~= 1 then
-      v = clamp(math.floor(v * gain), -32768, 32767)
-      buf[i] = v
-    end
-    sum = sum + v * v
-  end
+  for i = 0, count - 1 do local v = buf[i]; sum = sum + v * v end
   return math.sqrt(sum / count)
 end
 
@@ -384,7 +381,9 @@ end
 ---------------------------------------------------------------------------
 
 local KNEE = 26000
-function A.applyGain(buf, n, g)
+local applyGain
+function A.applyGain(buf, n, g) return applyGain(buf, n, g) end
+function applyGain(buf, n, g)
   if g == 1 then return end
   for i = 0, n - 1 do
     local v = buf[i] * g
@@ -469,6 +468,31 @@ function A.resample(src, n, from, to)
     out[i] = math.floor(a + (b - a) * f + 0.5)
   end
   return out, m
+end
+
+
+---------------------------------------------------------------------------
+-- Автогромкость микрофона (AGC): тихий микрофон подтягивается до нормального
+-- уровня речи, громкий — приглушается. Подстраивается только во время речи,
+-- поэтому в паузах шум не раздувается.
+---------------------------------------------------------------------------
+
+A.AGC_TARGET = 4000   -- RMS речи ≈ -18 дБ
+A.AGC_MAX = 10        -- не больше +20 дБ
+A.AGC_SPEECH = 120    -- ниже — тишина/шум, усиление не меняем
+
+function A.newAgc() return { g = 1 } end
+
+-- loud: множитель целевой громкости (ползунок «Усиление»: 1 = норма, 2 = вдвое громче).
+function A.agc(st, buf, n, rms, loud)
+  if rms >= A.AGC_SPEECH then
+    local target = math.min(A.AGC_TARGET * (loud or 1), 9000)
+    local want = clamp(target / rms, 0.25, A.AGC_MAX * (loud or 1))
+    -- быстро убавляем (не оглушить), медленно прибавляем (не «качает»)
+    st.g = st.g + (want - st.g) * (want < st.g and 0.5 or 0.08)
+  end
+  applyGain(buf, n, st.g)
+  return st.g
 end
 
 return A

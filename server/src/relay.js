@@ -17,7 +17,7 @@ export const DEFAULT_CONFIG = {
   reportCooldownMs: 30000,
   // администраторы ретранслятора: [{ "name": "Admin", "key": "длинный-секрет" }]
   admins: [],
-  latestClientVersion: '0.5.6',
+  latestClientVersion: '0.5.7',
   minClientVersion: '0.4.0',
   // защита от перегрузки
   maxClients: 2000,

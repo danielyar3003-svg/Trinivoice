@@ -8,7 +8,7 @@
 --   audio.lua     кодеки, эффекты (рация, телефон, мегафон, стены), служебные звуки, WAV
 --   ui.lua        меню /tv на mimgui (необязательно)
 
-local SCRIPT_VERSION = '0.5.6'
+local SCRIPT_VERSION = '0.5.7'
 script_name('TriniVoice')
 script_author('TriniVoice')
 script_version(SCRIPT_VERSION)
@@ -65,7 +65,8 @@ local DEFAULTS = {
     mode = 2,
     vad_threshold = 700,
     mic_gain = 100,          -- %
-    master_volume = 100,     -- %
+    master_volume = 100,     -- %, до 200 (выше 100 — усиление звука)
+    agc = true,              -- автогромкость своего микрофона
     codec = 'ulaw',          -- ulaw | opus
     opus_bitrate = 24000,
     show_icons = true,
@@ -131,6 +132,7 @@ local net = { seq = 0, lastState = 0, lastAck = -100, status = 0, online = 0, ro
   -- диагностика (/tv diag) и автопереподключение
   wasConnected = false, openedAt = 0, sentAt = -100, sendingSince = 0, reopens = 0, tokens = 0, rx = 0, tx = 0, lastStatus = nil }
 local speakers = {}
+local agcState = A.newAgc() -- автогромкость микрофона
 local tx = { active = false, mode = nil, vadUntil = 0, level = 0, monitor = false, recording = false }
 local call                  -- { state = 'in'|'out'|'active', peerId, peerNick, since }
 local nextRing = 0
@@ -233,7 +235,7 @@ end
 local function playLocal(name, volume)
   if not fxStream or fxStream == 0 then return end
   local s = soundsFor(LOCAL_RATE)[name]
-  bass.BASS_ChannelSetAttribute(fxStream, 2, (volume or 1) * cfg.main.master_volume / 100)
+  bass.BASS_ChannelSetAttribute(fxStream, 2, (volume or 1) * math.min(1, cfg.main.master_volume / 100))
   bass.BASS_StreamPutData(fxStream, s[1], s[2] * 2)
 end
 
@@ -422,6 +424,8 @@ local function processCapture(now)
     if bass.BASS_ChannelGetData(rec, pcmIn, frameBytes) ~= frameBytes then break end
     local rms = A.applyGainAndRms(pcmIn, codec.frame, gain)
     tx.level = math.max(A.levelFromRms(rms), tx.level * 0.8)
+    -- автогромкость после замера: порог активации голосом работает как раньше
+    if cfg.main.agc then tx.agcGain = A.agc(agcState, pcmIn, codec.frame, rms, gain) end
     if micTest and micTest.phase == 'rec' then
       -- кодируем и сразу раскодируем: вы услышите ровно то, что слышат другие
       local payload = codec.encode(pcmIn, codec.frame)
@@ -469,6 +473,11 @@ local function ringFor(nick, rate)
 end
 
 -- Обработка и отправка кадра в поток собеседника.
+-- Во сколько раз поднять звук собеседника сверх 1 (общая громкость × личная).
+local function boostFor(nick)
+  return cfg.main.master_volume / 100 * (tonumber(cfg.volume[nick]) or 100) / 100
+end
+
 local function putFrame(sp, pcm, n)
   if not pcm or n <= 0 then return end
   local rate = sp.codec.rate
@@ -482,8 +491,8 @@ local function putFrame(sp, pcm, n)
     A.muffle(pcm, n, rate, sp.cutoff, sp.fx)
   end
   -- громче 100%: усиливаем сам звук (громкость канала BASS выше 1 не поднимается)
-  local personal = (tonumber(cfg.volume[sp.nick]) or 100) / 100
-  if personal > 1 then A.applyGain(pcm, n, personal) end
+  local boost = boostFor(sp.nick)
+  if boost > 1 then A.applyGain(pcm, n, boost) end
   bass.BASS_StreamPutData(sp.stream, pcm, n * 2)
 end
 
@@ -569,9 +578,8 @@ local function updateSpeakers(now)
   local mx, my, mz = getCharCoordinates(PLAYER_PED)
   local cx, cy = getActiveCameraCoordinates()
   local px, py = getActiveCameraPointAt()
-  local master = cfg.main.master_volume / 100
   for id, sp in pairs(speakers) do
-    local personal = math.min(1, (tonumber(cfg.volume[sp.nick]) or 100) / 100) -- выше 1 — в putFrame
+    local level = math.min(1, boostFor(sp.nick)) -- выше 1 — усиление в putFrame
     if sp.route == P.ROUTE_RADIO and not sp.closed and now - sp.last > 0.25 then
       sp.closed = true
       if cfg.main.fx_radio then
@@ -588,11 +596,11 @@ local function updateSpeakers(now)
         sp.occAt = now
         sp.cutoff, sp.occVol = occlusion(ped)
       end
-      local vol = A.distanceVolume(dist3(mx, my, mz, sx, sy, sz), P.MODE_RANGE[sp.mode or 2]) * master * personal * sp.occVol
+      local vol = A.distanceVolume(dist3(mx, my, mz, sx, sy, sz), P.MODE_RANGE[sp.mode or 2]) * level * sp.occVol
       bass.BASS_ChannelSetAttribute(sp.stream, 2 --[[VOL]], vol)
       bass.BASS_ChannelSetAttribute(sp.stream, 3 --[[PAN]], A.stereoPan(mx, my, sx, sy, px - cx, py - cy))
     else
-      local vol = master * personal * (sp.route == P.ROUTE_RADIO and cfg.main.radio_volume / 100 or 1)
+      local vol = level * (sp.route == P.ROUTE_RADIO and cfg.main.radio_volume / 100 or 1)
       bass.BASS_ChannelSetAttribute(sp.stream, 2, vol)
       bass.BASS_ChannelSetAttribute(sp.stream, 3, 0)
     end
@@ -678,7 +686,7 @@ local function processMicTest(now)
       return
     end
     local out, m = A.resample(buf, n, codec.rate, LOCAL_RATE)
-    bass.BASS_ChannelSetAttribute(fxStream, 2, cfg.main.master_volume / 100)
+    bass.BASS_ChannelSetAttribute(fxStream, 2, math.min(1, cfg.main.master_volume / 100))
     bass.BASS_StreamPutData(fxStream, out, m * 2)
     micTest = { phase = 'play', untilAt = now + m / LOCAL_RATE + 0.3 }
   else
@@ -1107,7 +1115,8 @@ local HELP = {
   '/tv mode 1-3 - шёпот, обычный, крик (или плитки в меню); /tv ptt | vad - клавиша или голос',
   '/tv radio on | off | ЧАСТОТА - рация (например /tv radio 911.0), /tv radiopass ПАРОЛЬ',
   '/tv call ID - позвонить, /tv accept - ответить, /tv decline | hangup - сбросить',
-  '/tv mute ID | unmute ID, /tv vol ID 0-200, /tv master 0-100, /tv gain 50-400',
+  '/tv mute ID | unmute ID, /tv vol ID 0-200, /tv master 0-200, /tv gain 50-400',
+  '/tv agc on | off - автогромкость микрофона (тихий микрофон подтягивается сам)',
   '/tv players - все с TriniVoice на сервере, /tv freqlist - кто на моей частоте',
   '/tv dnd on | off - не принимать звонки / снова принимать',
   '/tv mictest - прослушать свой голос (4 секунды записи, потом воспроизведение)',
@@ -1158,6 +1167,9 @@ local function onCommand(args)
     m.mic_ready = a[2] == 'on'
     msg(m.mic_ready and 'микрофон всегда готов: нажатие клавиши без задержки'
       or 'микрофон включается только на время нажатия (на некоторых микрофонах — микрофриз)')
+  elseif c == 'agc' and (a[2] == 'on' or a[2] == 'off') then
+    m.agc = a[2] == 'on'
+    msg(m.agc and 'автогромкость микрофона включена' or 'автогромкость выключена: голос идёт как есть (× усиление)')
   elseif c == 'diag' then
     local now = os.clock()
     msg(('диагностика v%s: %s:%d, комната %s'):format(SCRIPT_VERSION, m.host, m.port, tostring(net.room)))
@@ -1196,7 +1208,7 @@ local function onCommand(args)
     cfg.volume[nick] = clamp(math.floor(tonumber(a[3])), 0, 200)
     msg(('громкость %s: %d%%'):format(nick, cfg.volume[nick]))
   elseif c == 'master' and tonumber(a[2]) then
-    m.master_volume = clamp(math.floor(tonumber(a[2])), 0, 100); msg('общая громкость: ' .. m.master_volume .. '%')
+    m.master_volume = clamp(math.floor(tonumber(a[2])), 0, 200); msg('общая громкость: ' .. m.master_volume .. '%')
   elseif c == 'gain' and tonumber(a[2]) then
     m.mic_gain = clamp(math.floor(tonumber(a[2])), 50, 400); msg('усиление микрофона: ' .. m.mic_gain .. '%')
   elseif c == 'codec' and (a[2] == 'ulaw' or a[2] == 'opus') then

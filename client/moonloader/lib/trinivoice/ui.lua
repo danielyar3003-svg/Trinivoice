@@ -507,7 +507,7 @@ local function pageHome(st)
   local vv = ('%d%%'):format(m.master_volume)
   local vsz = textSize(vv, fonts.bold)
   textMid(X0 + CW - 16 - vsz.x, y, 58, vv, C.white, fonts.bold)
-  local nv = slider('##master', tx + 150, y + 26, CW - (tx - X0) - 150 - 70, m.master_volume, 0, 100)
+  local nv = slider('##master', tx + 150, y + 26, CW - (tx - X0) - 150 - 70, m.master_volume, 0, 200)
   if nv then ctx.set('master_volume', nv) end
 end
 
@@ -710,7 +710,7 @@ local function pageSound(st)
 
   card(X0, y, hw, 176)
   sectionTitle(X0 + 16, y + 14, 'Громкость')
-  local rows = { { 'Громкость других', 'master_volume', 0, 100 }, { 'Усиление микрофона', 'mic_gain', 50, 400 } }
+  local rows = { { 'Громкость других', 'master_volume', 0, 200 }, { 'Усиление микрофона', 'mic_gain', 50, 400 } }
   for i, r in ipairs(rows) do
     local ry = y + 44 + (i - 1) * 62
     text(X0 + 16, ry, r[1], C.soft)
@@ -745,7 +745,9 @@ local function pageSound(st)
   local note = st.opusAvailable and 'Opus: лучше звук, нужен opus.dll у всех'
     or 'opus.dll не найден в moonloader/lib'
   text(X0 + 16, y + 94, note, st.opusAvailable and C.muted or C.orangeText, fonts.small)
-  text(X0 + 16, y + 114, 'u-law работает у всех без доп. файлов', C.muted, fonts.small)
+  text(X0 + 16, y + 112, 'u-law работает у всех без доп. файлов', C.muted, fonts.small)
+  textMid(X0 + 16, y + 132, 26, 'Автогромкость микрофона', C.soft)
+  if toggle('##agc', X0 + hw - 16 - 46, y + 132, m.agc) then ctx.set('agc', not m.agc) end
 
   card(mx, y, hw, 164)
   sectionTitle(mx + 16, y + 14, 'Эффекты')

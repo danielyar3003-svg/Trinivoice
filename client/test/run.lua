@@ -101,8 +101,9 @@ test('frequencies and versions', function()
 end)
 
 test('distance volume and stereo pan', function()
-  eq(A.distanceVolume(0, 15), 1); eq(A.distanceVolume(3, 15), 1); eq(A.distanceVolume(15, 15), 0)
-  assert(math.abs(A.distanceVolume(9.375, 15) - 0.5) < 1e-9)
+  eq(A.distanceVolume(0, 15), 1); eq(A.distanceVolume(6, 15), 1); eq(A.distanceVolume(15, 15), 0)
+  assert(math.abs(A.distanceVolume(10.5, 15) - 0.5) < 1e-9)
+  assert(A.distanceVolume(8, 15) > 0.8, 'stays loud for a while')
   assert(A.stereoPan(0, 0, 10, 0, 0, 1) > 0.7)   -- смотрим на север, говорящий на востоке — справа
   assert(A.stereoPan(0, 0, -10, 0, 0, 1) < -0.7)
   eq(A.stereoPan(0, 0, 0.1, 0, 0, 1), 0)
@@ -111,7 +112,7 @@ end)
 test('gain, rms, level', function()
   local b = ffi.new('int16_t[4]', { 1000, -1000, 30000, -30000 })
   local rms = A.applyGainAndRms(b, 4, 2)
-  eq(b[0], 2000); eq(b[2], 32767); eq(b[3], -32768)
+  eq(b[0], 2000); assert(b[2] > 26000 and b[2] <= 32767); assert(b[3] < -26000 and b[3] >= -32767)
   assert(rms > 20000)
   eq(A.levelFromRms(0), 0); eq(A.levelFromRms(32768), 1)
   assert(math.abs(A.levelFromRms(32.768) - 0) < 1e-9)
@@ -208,6 +209,27 @@ test('gain above 100% amplifies and never clips harshly', function()
   assert(b[2] > 26000 and b[2] <= 32767, 'soft knee ' .. b[2])
   assert(b[3] < -26000 and b[3] >= -32767, 'soft knee ' .. b[3])
   local c = ffi.new('int16_t[1]', { 1234 }); A.applyGain(c, 1, 1); eq(c[0], 1234)
+end)
+
+test('automatic mic gain: quiet voice is raised, loud lowered, silence untouched, slider still works', function()
+  local function run(amp, frames, loud)
+    local st, b, out = A.newAgc(), ffi.new('int16_t[160]'), 0
+    for _ = 1, frames do
+      for i = 0, 159 do b[i] = math.floor(amp * math.sin(i * 0.3)) end
+      local rms = A.applyGainAndRms(b, 160, 1)
+      A.agc(st, b, 160, rms, loud)
+      out = A.applyGainAndRms(b, 160, 1)
+    end
+    return out, st.g
+  end
+  local quiet = run(700, 100)            -- тихий микрофон (RMS ≈ 500)
+  assert(quiet > 3000 and quiet < 5000, 'quiet raised to normal: ' .. quiet)
+  local loud = run(20000, 100)
+  assert(loud > 3000 and loud < 6000, 'loud lowered: ' .. loud)
+  local _, g = run(50, 100)              -- тишина/шум: усиление не растёт
+  eq(g, 1)
+  local louder = run(700, 100, 2)        -- ползунок 200% — вдвое громче нормы
+  assert(louder > quiet * 1.7, 'slider changes loudness with AGC on: ' .. louder)
 end)
 
 local function makeWav(rate, channels, bits, frames, fn)
