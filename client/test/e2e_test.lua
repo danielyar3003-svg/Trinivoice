@@ -208,6 +208,8 @@ run(1)
 a.cmd('server 127.0.0.1 ' .. PORT)
 b.cmd('server 127.0.0.1 ' .. PORT)
 -- TV_E2E_CODEC=opus — тот же прогон с кодеком Opus (нужен libopus в LD_LIBRARY_PATH)
+-- старые настройки (до 0.5.8, без cfg_rev) переводятся на Opus; без библиотеки — u-law с подсказкой
+assert(c.saw('opus.dll не найден') or os.getenv('TV_E2E_CODEC') == 'opus', 'old ini migrated to Opus')
 if os.getenv('TV_E2E_CODEC') == 'opus' then
   for _, cl in ipairs(clients) do cl.cmd('codec opus') end
   assert(a.saw('кодек: Opus'), 'opus library not found for the e2e run')
@@ -273,7 +275,7 @@ test('walls muffle and lower volume', function()
   local vol
   for k, v in pairs(b.st.attr) do if k:match(':2$') and tonumber(k:match('^(%d+)')) ~= b.st.fx then vol = v end end
   world.wall = false
-  assert(vol and vol <= 0.56, 'volume behind wall should be <= 0.55, got ' .. tostring(vol))
+  assert(vol and vol <= 0.71 and vol > 0.3, 'volume behind wall should be about 0.7, got ' .. tostring(vol))
 end)
 
 test('radio: same frequency hears across the map', function()

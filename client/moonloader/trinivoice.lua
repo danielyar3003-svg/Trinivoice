@@ -8,7 +8,7 @@
 --   audio.lua     кодеки, эффекты (рация, телефон, мегафон, стены), служебные звуки, WAV
 --   ui.lua        меню /tv на mimgui (необязательно)
 
-local SCRIPT_VERSION = '0.5.7'
+local SCRIPT_VERSION = '0.5.8'
 script_name('TriniVoice')
 script_author('TriniVoice')
 script_version(SCRIPT_VERSION)
@@ -49,6 +49,7 @@ for _, m in ipairs({ 596, 597, 598, 599, 523, 427, 490, 528, 601, 497, 430, 416,
 
 local STATE_INTERVAL = 0.2   -- сек между отправками позиции
 local SPEAKER_IDLE = 5.0     -- сек тишины, после которых поток собеседника освобождается
+local JITTER_FRAMES = 5      -- 100 мс запаса в начале фразы: голос без рывков по Wi-Fi/мобильному
 local MAX_QUEUE_SEC = 0.4    -- больше этого в очереди воспроизведения не копим
 local KNOWN_TTL = 300        -- сек: столько игрок остаётся в списке «Игроки рядом»
 local REPORT_SECONDS = 30
@@ -67,8 +68,9 @@ local DEFAULTS = {
     mic_gain = 100,          -- %
     master_volume = 100,     -- %, до 200 (выше 100 — усиление звука)
     agc = true,              -- автогромкость своего микрофона
-    codec = 'ulaw',          -- ulaw | opus
-    opus_bitrate = 24000,
+    codec = 'opus',          -- ulaw | opus; Opus чётче, без opus.dll скрипт сам берёт u-law
+    opus_bitrate = 32000,
+    cfg_rev = 2,             -- версия настроек (для переноса старых значений)
     show_icons = true,
     show_hud = true,
     accent = '#6E8BFF',
@@ -107,12 +109,19 @@ local function loadConfig()
     for k, v in pairs(t) do r[k] = type(v) == 'table' and copy(v) or v end
     return r
   end
+  -- настройки до 0.5.8 хранили кодек u-law по умолчанию: переводим на Opus один раз
+  local okRaw, raw = pcall(inicfg.load, nil, INI)
+  local oldRev = okRaw and type(raw) == 'table' and type(raw.main) == 'table' and (tonumber(raw.main.cfg_rev) or 1) or 2
   local c = inicfg.load(copy(DEFAULTS), INI) or {}
   for sec, keys in pairs(DEFAULTS) do
     if type(c[sec]) ~= 'table' then c[sec] = {} end
     for k, v in pairs(keys) do
       if c[sec][k] == nil then c[sec][k] = v end
     end
+  end
+  if oldRev < 2 then
+    c.main.codec, c.main.opus_bitrate = 'opus', DEFAULTS.main.opus_bitrate
+    c.main.cfg_rev = 2
   end
   return c
 end
@@ -321,10 +330,11 @@ local function occlusion(ped)
   if not cfg.main.occlusion then return nil, 1 end
   local mx, my, mz = getCharCoordinates(PLAYER_PED)
   local sx, sy, sz = getCharCoordinates(ped)
-  if not isLineOfSightClear(mx, my, mz + 0.6, sx, sy, sz + 0.6, true, false, false, true, false) then
-    return 700, 0.55 -- стена
+  -- только здания: столбы, заборы и маппинг сервера голос не глушат
+  if not isLineOfSightClear(mx, my, mz + 0.6, sx, sy, sz + 0.6, true, false, false, false, false) then
+    return 1400, 0.7 -- стена: глуше и тише, но разборчиво
   end
-  if carOf(PLAYER_PED) ~= carOf(ped) then return 1800, 0.8 end -- один из нас в машине
+  if carOf(PLAYER_PED) ~= carOf(ped) then return 3500, 0.9 end -- один из нас в машине
   return nil, 1
 end
 
@@ -561,9 +571,14 @@ local function onVoice(p, now)
       local s = soundsFor(c.rate).sqOpen
       bass.BASS_StreamPutData(sp.stream, s[1], s[2] * 2)
     else
-      local pad = ffi.new('int16_t[?]', c.frame * 3)
-      bass.BASS_StreamPutData(sp.stream, pad, c.frame * 3 * 2)
+      local pad = ffi.new('int16_t[?]', c.frame * JITTER_FRAMES)
+      bass.BASS_StreamPutData(sp.stream, pad, c.frame * JITTER_FRAMES * 2)
     end
+  elseif queued == 0 then
+    -- посреди фразы буфер опустел (пакеты пришли рывком): небольшой запас,
+    -- чтобы дальше не прерывалось на каждом пакете
+    local pad = ffi.new('int16_t[?]', c.frame * 2)
+    bass.BASS_StreamPutData(sp.stream, pad, c.frame * 2 * 2)
   end
   local pcm, n = sp.dec:decode(p.payload)
   if pcm and n > 0 then
