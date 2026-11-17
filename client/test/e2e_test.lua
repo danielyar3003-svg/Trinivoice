@@ -19,6 +19,14 @@ local function deepcopy(t)
   return r
 end
 
+local function cstr(s) local b = ffi.new('char[?]', #s + 1, s); return b end
+local micDevices = {
+  { name = A.cp('Микрофон (Realtek Audio)'), flags = 1 + 2 },
+  { name = 'Stereo Mix', flags = 1 + 8 },      -- loopback: не показываем
+  { name = 'USB Headset', flags = 1 },
+}
+for _, d in ipairs(micDevices) do d.cname = cstr(d.name) end
+
 local function newClient(id, nick, x, y, iniData, serverIni)
   local ped = 1000 + id
   world.players[id] = { nick = nick, x = x, y = y, z = 10, ped = ped, car = nil }
@@ -32,7 +40,15 @@ local function newClient(id, nick, x, y, iniData, serverIni)
     BASS_GetDevice = function() return 0 end,
     BASS_Init = function() return 1 end,
     BASS_ErrorGetCode = function() return 0 end,
-    BASS_RecordInit = function() return 1 end,
+    BASS_RecordInit = function(dev) st.recInit = dev; return 1 end,
+    -- два микрофона: основной (имя в CP1251, как отдаёт Windows) и гарнитура
+    BASS_RecordGetDeviceInfo = function(dev, info)
+      local d = micDevices[dev + 1]
+      if not d then return 0 end
+      info.name, info.driver, info.flags = d.cname, nil, d.flags
+      return 1
+    end,
+    BASS_RecordSetDevice = function(dev) st.recDevice = dev; return 1 end,
     BASS_RecordStart = function(freq) recRate = freq; recOn = false; recAvail = 0; return 100 end,
     BASS_ChannelGetData = function(h, buf, len)
       if h ~= 100 then return 0 end
@@ -470,6 +486,25 @@ test('router forgets the UDP session: script notices, reconnects and keeps worki
   local b0 = b.received()
   hold(a, X, 25)
   assert(b.received() - b0 > 3000, 'neighbour hears the player again')
+end)
+
+test('choose a microphone: list, switch, remembered by name', function()
+  a.st.chat = {}
+  a.cmd('mics')
+  assert(a.saw('1 - Микрофон (Realtek Audio) (основной)'), 'default mic listed in Russian')
+  assert(a.saw('2 - USB Headset'), 'headset listed')
+  assert(not a.saw('Stereo Mix'), 'loopback devices hidden')
+  a.cmd('mic 2')
+  eq2(a.st.recDevice, 2) -- индекс устройства BASS
+  assert(a.saw('микрофон: USB Headset'))
+  local b0 = b.received()
+  hold(a, X, 25)
+  assert(b.received() - b0 > 3000, 'voice still goes out from the new microphone')
+  a.cmd('mic 0')
+  eq2(a.st.recDevice, 0)
+  assert(a.saw('микрофон: Основной: Микрофон (Realtek Audio)'))
+  a.cmd('mic 7')
+  assert(a.saw('нет микрофона с номером 7'))
 end)
 
 test('admin stats: how many players use TriniVoice', function()

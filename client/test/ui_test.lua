@@ -177,7 +177,7 @@ local function makeCtx(players)
     mic_gain = 150, master_volume = 80, vad_threshold = 700, codec = 'ulaw', show_icons = true,
     show_hud = true, accent = '#6E8BFF', host = '1.2.3.4', port = 7790, radio_on = true, radio_freq = 911.0,
     radio_pass = '', radio_key = 0x5A, radio_volume = 90, occlusion = true, fx_radio = true, megaphone = true,
-    ptt_sound = false, dnd = false }, muted = {}, volume = {} }
+    ptt_sound = false, dnd = false, mic_device = '' }, muted = {}, volume = {} }
   local roomList = { entries = {
     { id = 1, nick = 'Ivan_Petrov', flags = 0 }, { id = 7, nick = 'Me_Myself', flags = 0 },
     { id = 8, nick = 'Sergey_Orlov', flags = 2 }, { id = 9, nick = 'Quiet_Guy', flags = 1 },
@@ -235,6 +235,10 @@ local function makeCtx(players)
     binding = function() return nil end,
     startBinding = function(w) assert(w == 'ptt' or w == 'radio', 'only talk and radio keys can be bound: ' .. tostring(w)) end,
     keyName = function(k) return k == 0x58 and 'X' or 'Z' end,
+    mics = function() return frameNo % 4 == 0 and {} or { { index = 0, name = 'Микрофон (Realtek High Definition Audio с очень длинным названием)', default = true },
+      { index = 1, name = 'USB Headset', default = false } } end,
+    micName = function() return cfg.main.mic_device ~= '' and cfg.main.mic_device or 'Основной: Микрофон (Realtek)' end,
+    setMic = function(n) assert(type(n) == 'string'); cfg.main.mic_device = n; log[#log + 1] = 'mic' end,
   }
   return ctx, log
 end

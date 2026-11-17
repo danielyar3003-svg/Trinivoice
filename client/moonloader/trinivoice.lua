@@ -8,7 +8,7 @@
 --   audio.lua     кодеки, эффекты (рация, телефон, мегафон, стены), служебные звуки, WAV
 --   ui.lua        меню /tv на mimgui (необязательно)
 
-local SCRIPT_VERSION = '0.5.9'
+local SCRIPT_VERSION = '0.6.0'
 script_name('TriniVoice')
 script_author('TriniVoice')
 script_version(SCRIPT_VERSION)
@@ -72,6 +72,7 @@ local DEFAULTS = {
     mic_gain = 100,          -- %
     master_volume = 100,     -- %, до 200 (выше 100 — усиление звука)
     agc = true,              -- автогромкость своего микрофона
+    mic_device = '',         -- название микрофона ('' — основной микрофон Windows)
     codec = 'opus',          -- ulaw | opus; Opus чётче, без opus.dll скрипт сам берёт u-law
     opus_bitrate = 32000,
     cfg_rev = 2,             -- версия настроек (для переноса старых значений)
@@ -190,6 +191,9 @@ local function initBass()
     DWORD __stdcall BASS_GetDevice(void);
     int __stdcall BASS_ErrorGetCode(void);
     BOOL __stdcall BASS_RecordInit(int device);
+    typedef struct { const char *name; const char *driver; DWORD flags; } BASS_DEVICEINFO;
+    BOOL __stdcall BASS_RecordGetDeviceInfo(DWORD device, BASS_DEVICEINFO *info);
+    BOOL __stdcall BASS_RecordSetDevice(DWORD device);
     DWORD __stdcall BASS_RecordStart(DWORD freq, DWORD chans, DWORD flags, void *proc, void *user);
     DWORD __stdcall BASS_ChannelGetData(DWORD handle, void *buffer, DWORD length);
     BOOL __stdcall BASS_ChannelPlay(DWORD handle, BOOL restart);
@@ -267,12 +271,58 @@ local function stopRecording()
   if rec then bass.BASS_ChannelStop(rec); rec = nil end
 end
 
+-- Микрофоны: включённые устройства записи без «loopback» (запись звука колонок).
+-- Названия от Windows приходят в CP1251 — храним и показываем в UTF-8.
+local micCache, micCacheAt = nil, -100
+local function listMics(fresh)
+  if not fresh and micCache and os.clock() - micCacheAt < 2 then return micCache end
+  local list = {}
+  if bass then
+    local info = ffi.new('BASS_DEVICEINFO')
+    for i = 0, 63 do
+      local ok, res = pcall(bass.BASS_RecordGetDeviceInfo, i, info)
+      if not ok or res == 0 then break end
+      local flags = tonumber(info.flags) or 0
+      if bit.band(flags, 1) ~= 0 and bit.band(flags, 8) == 0 and info.name ~= nil then
+        list[#list + 1] = { index = i, name = A.u8(ffi.string(info.name)), default = bit.band(flags, 2) ~= 0 }
+      end
+    end
+  end
+  micCache, micCacheAt = list, os.clock()
+  return list
+end
+
+-- Устройство для записи: выбранное по названию, иначе основное в Windows.
+local function pickMic()
+  local want = tostring(cfg.main.mic_device or '')
+  local def
+  for _, d in ipairs(listMics(true)) do
+    if want ~= '' and d.name == want then return d.index, d.name, false end
+    if d.default then def = d end
+  end
+  return def and def.index or -1, def and def.name or nil, want ~= ''
+end
+
+local function micName()
+  local want = tostring(cfg.main.mic_device or '')
+  if want ~= '' then return want end
+  for _, d in ipairs(listMics()) do if d.default then return 'Основной: ' .. d.name end end
+  return 'Основной микрофон Windows'
+end
+
+local warnedMic
 local function startRecording()
   stopRecording()
+  local dev, _, missing = pickMic()
+  if missing and warnedMic ~= cfg.main.mic_device then
+    warnedMic = cfg.main.mic_device
+    msg('микрофон «' .. cfg.main.mic_device .. '» не найден (отключён?) — пишу с основного. Выбрать: /tv mics')
+  end
   -- BOOL из C: 0 = ошибка (в Lua 0 считается истиной, поэтому сравниваем явно)
-  if bass.BASS_RecordInit(-1) == 0 and bass.BASS_ErrorGetCode() ~= 14 --[[ALREADY]] then
+  if bass.BASS_RecordInit(dev) == 0 and bass.BASS_ErrorGetCode() ~= 14 --[[ALREADY]] then
     return false, 'микрофон недоступен (код ' .. bass.BASS_ErrorGetCode() .. ')'
   end
+  if dev >= 0 then pcall(bass.BASS_RecordSetDevice, dev) end
   local h = bass.BASS_RecordStart(codec.rate, 1, 0x8000 --[[RECORD_PAUSE]], nil, nil)
   if h == 0 then return false, 'не удалось начать запись (код ' .. bass.BASS_ErrorGetCode() .. ')' end
   rec = h
@@ -1034,6 +1084,15 @@ local function setCodec(name)
   markDirty()
 end
 
+local function setMic(name)
+  cfg.main.mic_device = name or ''
+  warnedMic = nil
+  local ok, err = startRecording()
+  if not ok then msg(err) end
+  msg('микрофон: ' .. micName())
+  markDirty()
+end
+
 local function setServer(host, port)
   cfg.main.host, cfg.main.port = host, port
   cfg.main.server_pick = 1
@@ -1124,6 +1183,9 @@ local uiContext = {
   setMode = function(m) cfg.main.mode = m; markDirty() end,
   setActivation = function(a) cfg.main.activation = a; markDirty() end,
   setCodec = setCodec,
+  mics = function() return listMics() end,
+  micName = micName,
+  setMic = setMic,
   setServer = setServer,
   setRadio = setRadio,
   radioPresets = radioPresets,
@@ -1163,6 +1225,7 @@ local HELP = {
   '/tv radio on | off | ЧАСТОТА - рация (например /tv radio 911.0), /tv radiopass ПАРОЛЬ',
   '/tv call ID - позвонить, /tv accept - ответить, /tv decline | hangup - сбросить',
   '/tv mute ID | unmute ID, /tv vol ID 0-200, /tv master 0-200, /tv gain 50-400',
+  '/tv mics - список микрофонов, /tv mic НОМЕР - выбрать (0 - основной в Windows)',
   '/tv agc on | off - автогромкость микрофона (тихий микрофон подтягивается сам)',
   '/tv players - все с TriniVoice на сервере, /tv freqlist - кто на моей частоте',
   '/tv dnd on | off - не принимать звонки / снова принимать',
@@ -1214,6 +1277,19 @@ local function onCommand(args)
     m.mic_ready = a[2] == 'on'
     msg(m.mic_ready and 'микрофон всегда готов: нажатие клавиши без задержки'
       or 'микрофон включается только на время нажатия (на некоторых микрофонах — микрофриз)')
+  elseif c == 'mics' then
+    local list = listMics(true)
+    msg('микрофоны (выбрать: /tv mic НОМЕР, 0 — основной в Windows):')
+    msg(('  0 - основной в Windows%s'):format(m.mic_device == '' and '  <- сейчас' or ''))
+    for i, d in ipairs(list) do
+      msg(('  %d - %s%s%s'):format(i, d.name, d.default and ' (основной)' or '', d.name == m.mic_device and '  <- сейчас' or ''))
+    end
+    if #list == 0 then msg('  других микрофонов не найдено') end
+  elseif c == 'mic' and tonumber(a[2]) then
+    local n, list = math.floor(tonumber(a[2])), listMics(true)
+    if n == 0 then setMic('')
+    elseif list[n] then setMic(list[n].name)
+    else msg('нет микрофона с номером ' .. n .. ': список — /tv mics') end
   elseif c == 'agc' and (a[2] == 'on' or a[2] == 'off') then
     m.agc = a[2] == 'on'
     msg(m.agc and 'автогромкость микрофона включена' or 'автогромкость выключена: голос идёт как есть (× усиление)')

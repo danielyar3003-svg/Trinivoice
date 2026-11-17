@@ -76,7 +76,7 @@ local MODE_LABEL = { 'шёпот', 'обычный', 'крик' }
 local FA_FILE = 'fontawesome-webfont.ttf'
 local FA_MIN, FA_MAX = 0xF000, 0xF2E0
 local FA = {
-  MICROPHONE = 0xF130, MICROPHONE_SLASH = 0xF131, HOUSE = 0xF015, USERS = 0xF0C0, SLIDERS = 0xF1DE,
+  MICROPHONE = 0xF130, CARET_DOWN = 0xF0D7, CHECK = 0xF00C, MICROPHONE_SLASH = 0xF131, HOUSE = 0xF015, USERS = 0xF0C0, SLIDERS = 0xF1DE,
   WALKIE_TALKIE = 0xF2CE, SERVER = 0xF233, EAR_LISTEN = 0xF2A2, COMMENT = 0xF075, VOLUME_HIGH = 0xF028,
   BULLHORN = 0xF0A1, KEYBOARD = 0xF11C, ARROWS_ROTATE = 0xF021, VOLUME_XMARK = 0xF026,
   MAGNIFYING_GLASS = 0xF002, XMARK = 0xF00D, PHONE = 0xF095, FLAG = 0xF024, TELEGRAM = 0xF2C6,
@@ -424,6 +424,46 @@ local function drawMeter(x, y, w, h, st)
   rect(x, ty, w, 1, alpha(C.orange, 0.6))
 end
 
+-- Обрезать строку по ширине (с «…»), не разрывая символы UTF-8.
+local function fitText(s, w, f)
+  if textSize(s, f).x <= w then return s end
+  local cut = s
+  while #cut > 0 do
+    cut = cut:gsub('[%z\1-\127\194-\244][\128-\191]*$', '')
+    if textSize(cut .. '…', f).x <= w then return cut .. '…' end
+  end
+  return '…'
+end
+
+-- Выбор микрофона (открывается кликом по названию на карточке «Микрофон»).
+local micPicker = false
+local function drawMicPicker()
+  local m = ctx.cfg.main
+  local items = { { name = '', label = 'Основной микрофон Windows' } }
+  for _, d in ipairs(ctx.mics()) do
+    items[#items + 1] = { name = d.name, label = d.name .. (d.default and '  (основной)' or '') }
+  end
+  local shown = math.min(#items, 7)
+  local y = 86
+  card(X0, y, CW, 64 + shown * 44 + 54)
+  sectionTitle(X0 + 16, y + 14, 'Выберите микрофон')
+  local cur = tostring(m.mic_device or '')
+  local check = icon('CHECK')
+  for i = 1, shown do
+    local it = items[i]
+    local by = y + 46 + (i - 1) * 44
+    local sel = it.name == cur
+    local mark = sel and (check ~= '' and check .. '  ' or '• ') or ''
+    if button('##mic' .. i, X0 + 16, by, CW - 32, 36, mark .. fitText(it.label, CW - 80, fonts.bold), sel) then
+      if not sel then ctx.setMic(it.name) end
+      micPicker = false
+      return
+    end
+  end
+  if #items > 7 then text(X0 + 16, y + 46 + shown * 44, 'Ещё микрофоны: команда /tv mics', C.muted, fonts.small) end
+  if button('##micCancel', X0 + 16, y + 64 + shown * 44 + 8, 140, 34, 'Отмена') then micPicker = false end
+end
+
 local function pageHome(st)
   local m = ctx.cfg.main
   header('Главная', st.muted and 'Голос выключен администратором ретранслятора'
@@ -431,6 +471,8 @@ local function pageHome(st)
   local tw = textSize('Включён', fonts.bold).x
   text(W - 26 - 32 - 12 - 46 - 10 - tw, 30, m.enabled and 'Включён' or 'Выключен', C.soft2, fonts.bold)
   if toggle('##enabled', W - 26 - 32 - 12 - 46, 25, m.enabled) then ctx.setEnabled(not m.enabled) end
+
+  if micPicker then drawMicPicker(); return end
 
   -- дальность речи
   local y = 86
@@ -476,7 +518,17 @@ local function pageHome(st)
   card(mx, y, hw, 192)
   sectionTitle(mx + 16, y + 14, 'Микрофон')
   local label, col = micLabel(st)
-  text(mx + 16, y + 34, label, col, fonts.small)
+  -- какой микрофон: клик — выбрать другой
+  local lsz = textSize(label, fonts.small)
+  local pw = hw - 32 - lsz.x - 12
+  local _, phov = hit('##micPick', mx + 16, y + 40, pw, 18)
+  if imgui.IsItemClicked(0) then micPicker = true end
+  local caret = icon('CARET_DOWN')
+  local cw = caret ~= '' and textSize(caret, fonts.small).x + 6 or 0
+  local nameCol = phov and C.white or C.soft2
+  text(mx + 16, y + 40, fitText(ctx.micName(), pw - cw, fonts.small), nameCol, fonts.small)
+  if caret ~= '' then text(mx + 16 + math.min(pw - cw, textSize(fitText(ctx.micName(), pw - cw, fonts.small), fonts.small).x) + 6, y + 40, caret, nameCol, fonts.small) end
+  text(mx + hw - 16 - lsz.x, y + 40, label, col, fonts.small)
   -- прослушать себя: 4 сек записи, потом воспроизведение
   local mt = ctx.micTest()
   local bw, bh = 150, 28
@@ -489,7 +541,7 @@ local function pageHome(st)
     local sz = textSize(busy, fonts.bold)
     text(bx + (bw - sz.x) / 2, y + 10 + (bh - sz.y) / 2, busy, C.white, fonts.bold)
   end
-  drawMeter(mx + 16, y + 54, hw - 32, 42, st)
+  drawMeter(mx + 16, y + 64, hw - 32, 36, st)
   text(mx + 16, y + 112, 'Усиление', C.soft)
   local gv = ('%d%%'):format(m.mic_gain)
   local gsz = textSize(gv, fonts.bold)
