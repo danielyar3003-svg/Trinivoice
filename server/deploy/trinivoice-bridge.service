@@ -1,0 +1,40 @@
+[Unit]
+Description=TriniVoice bridge (forwards players to the main relay)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=trinivoice-bridge
+Group=trinivoice-bridge
+WorkingDirectory=/opt/trinivoice-bridge/app
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node /opt/trinivoice-bridge/app/src/bridge.js /etc/trinivoice-bridge/config.json
+Restart=always
+RestartSec=3
+
+# Песочница: только сеть, ничего не пишет на диск, никаких прав.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+UMask=0077
+MemoryMax=256M
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target

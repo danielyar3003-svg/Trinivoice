@@ -16,8 +16,9 @@ RestartSec=3
 # Песочница: процесс видит систему только для чтения, пишет лишь в свою папку данных,
 # не может получить новые права, загрузить модули ядра или открыть что-то кроме сети IPv4/IPv6.
 NoNewPrivileges=yes
-CapabilityBoundingSet=
-AmbientCapabilities=
+# единственное право: открыть порт 443 для запасного канала мостов (TLS)
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 ProtectSystem=strict
 ReadWritePaths=/var/lib/trinivoice
 ProtectHome=yes

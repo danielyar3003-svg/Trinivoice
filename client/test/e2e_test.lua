@@ -19,7 +19,7 @@ local function deepcopy(t)
   return r
 end
 
-local function newClient(id, nick, x, y, iniData)
+local function newClient(id, nick, x, y, iniData, serverIni)
   local ped = 1000 + id
   world.players[id] = { nick = nick, x = x, y = y, z = 10, ped = ped, car = nil }
   local me = world.players[id]
@@ -56,7 +56,11 @@ local function newClient(id, nick, x, y, iniData)
     load = function(name) if name == 'bass' then return bass end error('no ' .. name) end,
   }, { __index = ffi })
   -- iniData: содержимое trinivoice.ini, как его прочитал бы inicfg (без подмешивания значений по умолчанию)
-  local inicfgStub = { load = function(def) return iniData and deepcopy(iniData) or deepcopy(def) end, save = function() return true end }
+  local inicfgStub = { load = function(def, file)
+    if file == 'trinivoice-server.ini' then return serverIni and deepcopy(serverIni) or nil end
+    if iniData then return deepcopy(iniData) end
+    return def and deepcopy(def) or nil
+  end, save = function() return true end }
   local vkeysStub = { id_to_name = function(k) return ({ [0x58] = 'X', [0x42] = 'B', [0x5A] = 'Z' })[k] or tostring(k) end }
   local sampevStub = {}
 
@@ -486,6 +490,29 @@ end)
 
 test('update notice when relay advertises a newer version', function()
   assert(updateSeen, 'relay config advertises 9.9.9') -- запомнено в первом тесте: чаты потом очищаются
+end)
+
+test('main address unreachable: script switches to the bridge and players still hear each other', function()
+  local BPORT = tonumber(arg[2])
+  -- основной адрес «заблокирован» (там никто не слушает), запасной — мост
+  -- свои настройки игрока + адреса от админа в отдельном файле (как в архиве игроков)
+  local d = newClient(4, 'Olga_Bridge', a.me.x + 4, a.me.y, { main = { host = '9.9.9.9', master_volume = 150, cfg_rev = 2 } },
+    { main = { host = '127.0.0.1', port = BPORT + 40, host2 = '127.0.0.1', port2 = BPORT } })
+  clients[#clients + 1] = d
+  run(500) -- 10 секунд игрового времени: основной молчит, скрипт пробует мост
+  assert(d.saw('пробую запасной сервер 127.0.0.1:' .. BPORT), 'tried the bridge')
+  assert(d.saw('подключено к голосовому серверу'), 'connected through the bridge')
+  local d0 = d.received()
+  hold(a, X, 25)
+  assert(d.received() - d0 > 3000, 'player behind the bridge hears a direct player')
+  local a0 = a.received()
+  hold(d, X, 25)
+  assert(a.received() - a0 > 3000, 'direct player hears the player behind the bridge')
+  d.st.chat = {}
+  d.cmd('diag')
+  assert(d.saw('запасной сервер 127.0.0.1:' .. BPORT), 'diag shows the bridge')
+  d.cmd('master 150')
+  assert(d.saw('общая громкость: 150%'), 'player settings kept, 200% scale works')
 end)
 
 for _, cl in ipairs(clients) do cl.cmd('off') end

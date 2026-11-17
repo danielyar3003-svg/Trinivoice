@@ -8,7 +8,7 @@
 --   audio.lua     кодеки, эффекты (рация, телефон, мегафон, стены), служебные звуки, WAV
 --   ui.lua        меню /tv на mimgui (необязательно)
 
-local SCRIPT_VERSION = '0.5.8'
+local SCRIPT_VERSION = '0.5.9'
 script_name('TriniVoice')
 script_author('TriniVoice')
 script_version(SCRIPT_VERSION)
@@ -61,6 +61,10 @@ local DEFAULTS = {
     enabled = true,
     host = '127.0.0.1',
     port = 7790,
+    -- запасной адрес (мост): если основной не отвечает, скрипт переключается сам
+    host2 = '',
+    port2 = 7790,
+    server_pick = 1,         -- 1 — основной, 2 — запасной (запоминается последний рабочий)
     activation = 'ptt',      -- ptt | vad
     ptt_key = 0x58,          -- X
     mode = 2,
@@ -129,6 +133,17 @@ local cfg = loadConfig()
 -- клавиши переключения дальности больше нет (только клавиши разговора и рации):
 -- убираем старую настройку из ini
 cfg.main.mode_key = nil
+-- Адреса серверов от администратора лежат отдельно (config/trinivoice-server.ini):
+-- обновление скрипта меняет только их и не сбрасывает настройки игрока.
+do
+  local ok, srv = pcall(inicfg.load, nil, 'trinivoice-server.ini')
+  local m = ok and type(srv) == 'table' and srv.main
+  if type(m) == 'table' and m.host and tostring(m.host) ~= '' then
+    if tostring(m.host) ~= tostring(cfg.main.host) or tostring(m.host2 or '') ~= tostring(cfg.main.host2 or '') then cfg.main.server_pick = 1 end
+    cfg.main.host, cfg.main.port = tostring(m.host), tonumber(m.port) or 7790
+    cfg.main.host2, cfg.main.port2 = tostring(m.host2 or ''), tonumber(m.port2) or 7790
+  end
+end
 
 local function save() inicfg.save(cfg, INI) end
 local function msg(text) sampAddChatMessage('[TriniVoice] {FFFFFF}' .. cp(text), 0x5BD75B) end
@@ -279,13 +294,20 @@ end
 -- Сеть
 ---------------------------------------------------------------------------
 
+local function hasBackup() return tostring(cfg.main.host2 or '') ~= '' end
+local function currentServer()
+  if cfg.main.server_pick == 2 and hasBackup() then return cfg.main.host2, tonumber(cfg.main.port2) or 7790, 'запасной' end
+  return cfg.main.host, cfg.main.port, 'основной'
+end
+
 local function openSocket()
   if udp then udp:close() end
   P.setToken(string.rep('\0', P.TOKEN_LEN)) -- новый ретранслятор — новый токен
   udp = socket.udp()
   udp:settimeout(0)
-  local ok, err = udp:setpeername(cfg.main.host, cfg.main.port)
-  if not ok then msg('не удалось подключиться к ' .. cfg.main.host .. ': ' .. tostring(err)); udp = nil end
+  local host, port = currentServer()
+  local ok, err = udp:setpeername(host, port)
+  if not ok then msg('не удалось подключиться к ' .. host .. ': ' .. tostring(err)); udp = nil end
   net.lastAck = -100
   net.openedAt = os.clock()
 end
@@ -791,7 +813,10 @@ local function onAck(p, now)
       msg('голос снова включён')
     end
   end
-  if (p.status == P.ACK_OK or p.status == P.ACK_MUTED) and now - net.lastAck > 5 then msg('подключено к голосовому серверу') end
+  if (p.status == P.ACK_OK or p.status == P.ACK_MUTED) and now - net.lastAck > 5 then
+    msg('подключено к голосовому серверу')
+    if net.savedPick ~= cfg.main.server_pick then net.savedPick = cfg.main.server_pick; markDirty() end
+  end
   net.status, net.online, net.radioListeners, net.mutedSec = p.status, p.online, p.radioListeners, p.mutedSec
   net.lastAck = now
   if net.stateAt and now - net.stateAt < 1 then net.ping = math.floor((now - net.stateAt) * 1000 + 0.5) end
@@ -929,6 +954,12 @@ local function processNetwork(now)
     end
     if now - net.lastAck > 6 and now - net.openedAt > 6 then
       net.reopens = net.reopens + 1
+      if hasBackup() then
+        -- не отвечает — пробуем другой адрес (основной ↔ мост), рабочий запомнится
+        cfg.main.server_pick = cfg.main.server_pick == 2 and 1 or 2
+        local host, port, which = currentServer()
+        if net.wasConnected or net.reopens <= 2 then msg(('пробую %s сервер %s:%d'):format(which, host, port)) end
+      end
       openSocket()
     end
   end
@@ -1005,6 +1036,7 @@ end
 
 local function setServer(host, port)
   cfg.main.host, cfg.main.port = host, port
+  cfg.main.server_pick = 1
   openSocket()
   markDirty()
 end
@@ -1139,7 +1171,7 @@ local HELP = {
   '/tv tg - открыть наш Telegram-канал (новости и обновления)',
   '/tv diag - диагностика связи (пришлите скрин админу, если голос отключается)',
   '/tv report ID причина - жалоба (сохраняет запись голоса)',
-  '/tv codec ulaw | opus, /tv icons, /tv hud, /tv server HOST PORT',
+  '/tv codec ulaw | opus, /tv icons, /tv hud, /tv server HOST PORT, /tv server2 HOST PORT | off',
   '/tv autocall on | off, /tv autocall start|end ШАБЛОН - звонки по сообщениям сервера',
   '/tv adminkey КЛЮЧ, /tv admin mute|unmute|ban|unban|kick НИК [минуты], /tv admin stats',
 }
@@ -1187,7 +1219,9 @@ local function onCommand(args)
     msg(m.agc and 'автогромкость микрофона включена' or 'автогромкость выключена: голос идёт как есть (× усиление)')
   elseif c == 'diag' then
     local now = os.clock()
-    msg(('диагностика v%s: %s:%d, комната %s'):format(SCRIPT_VERSION, m.host, m.port, tostring(net.room)))
+    local host, port, which = currentServer()
+    msg(('диагностика v%s: %s сервер %s:%d%s, комната %s'):format(SCRIPT_VERSION, which, host, port,
+      hasBackup() and (' (запасной %s:%d)'):format(m.host2, tonumber(m.port2) or 7790) or ' (запасного нет)', tostring(net.room)))
     msg(('связь: %s, последний ответ %s назад, пинг %d мс, статус %s'):format(
       isConnected(now) and 'есть' or 'НЕТ',
       net.lastAck < 0 and 'никогда' or ('%.1f с'):format(now - net.lastAck), net.ping,
@@ -1232,6 +1266,11 @@ local function onCommand(args)
     m.show_icons = not m.show_icons
   elseif c == 'hud' then
     m.show_hud = not m.show_hud
+  elseif c == 'server2' and a[2] == 'off' then
+    m.host2 = ''; m.server_pick = 1; markDirty(); openSocket(); msg('запасной сервер убран')
+  elseif c == 'server2' and a[2] and tonumber(a[3]) then
+    m.host2, m.port2 = a[2], tonumber(a[3]); markDirty()
+    msg(('запасной сервер: %s:%d (включится сам, если основной не отвечает)'):format(m.host2, m.port2))
   elseif c == 'server' and a[2] and tonumber(a[3]) then
     setServer(a[2], tonumber(a[3])); msg('ретранслятор: ' .. m.host .. ':' .. m.port)
   elseif c == 'autocall' and (a[2] == 'on' or a[2] == 'off') then

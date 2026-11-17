@@ -12,7 +12,7 @@ SRC="$(cd "$(dirname "$0")/.." && pwd)"
 echo "== 1/7 Пакеты (Node.js из репозитория Ubuntu, без сторонних источников)"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
-apt-get install -y -q nodejs iptables-persistent unattended-upgrades python3 curl
+apt-get install -y -q nodejs iptables-persistent unattended-upgrades python3 curl openssl
 NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
 if (( NODE_MAJOR < 18 )); then
   echo "Нужен Node.js 18+, в системе $(node -v). Создайте сервер на образе Ubuntu 24.04."
@@ -25,8 +25,10 @@ id trinivoice >/dev/null 2>&1 || useradd --system --home-dir /opt/trinivoice --s
 
 echo "== 3/7 Файлы программы"
 install -d -o root -g root -m 755 /opt/trinivoice /opt/trinivoice/app
-rm -rf /opt/trinivoice/app/src
-cp -r "$SRC/src" "$SRC/package.json" /opt/trinivoice/app/
+rm -rf /opt/trinivoice/app/src /opt/trinivoice/app/deploy /opt/trinivoice/app/client
+cp -r "$SRC/src" "$SRC/deploy" "$SRC/package.json" /opt/trinivoice/app/
+# клиент рядом с программой: из него «sudo trinivoice players-zip» собирает архив игроков
+if [[ -d "$SRC/client" ]]; then cp -r "$SRC/client" /opt/trinivoice/app/; fi
 chown -R root:root /opt/trinivoice/app
 chmod -R a+rX,go-w /opt/trinivoice/app
 install -d -o trinivoice -g trinivoice -m 700 /var/lib/trinivoice
@@ -35,6 +37,12 @@ cat > /usr/local/bin/trinivoice-stats <<'EOS'
 #!/bin/sh
 exec /usr/bin/node /opt/trinivoice/app/src/stats-cli.js /var/lib/trinivoice/stats.json "$@"
 EOS
+# команда для админа: sudo trinivoice add-bridge ru | set-backup IP | players-zip
+cat > /usr/local/bin/trinivoice <<'EOS'
+#!/bin/sh
+exec /usr/bin/node /opt/trinivoice/app/src/admin-cli.js "$@"
+EOS
+chmod 755 /usr/local/bin/trinivoice
 chmod 755 /usr/local/bin/trinivoice-stats
 install -d -o root -g trinivoice -m 750 /etc/trinivoice
 
@@ -74,6 +82,11 @@ fi
 if command -v ip6tables >/dev/null && ! ip6tables -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null; then
   ip6tables -I INPUT -p udp --dport "$PORT" -j ACCEPT || true
 fi
+# запасной канал мостов (TLS) — если мосты уже добавлены
+TLSPORT="$(node -e 'try{const c=JSON.parse(require("fs").readFileSync("/etc/trinivoice/config.json"));if((c.bridges||[]).length)console.log(c.bridgeTlsPort||443)}catch{}')"
+if [[ -n "$TLSPORT" ]] && ! iptables -C INPUT -p tcp --dport "$TLSPORT" -j ACCEPT 2>/dev/null; then
+  iptables -I INPUT -p tcp --dport "$TLSPORT" -j ACCEPT
+fi
 netfilter-persistent save >/dev/null
 
 echo "== 6/7 Служба systemd"
@@ -89,9 +102,9 @@ IP="${PUBLIC_IP:-$(curl -s -m 5 https://ifconfig.me || true)}"
 OWNER="${SUDO_USER:-root}"
 HOME_DIR="$(getent passwd "$OWNER" | cut -d: -f6)"
 if [[ "$IP" =~ ^[0-9.]+$ ]] && [[ -f "$SRC/client/moonloader/trinivoice.lua" ]]; then
-  bash "$SRC/deploy/make-player-zip.sh" "$IP" "$PORT" "$HOME_DIR/TriniVoice-players.zip" >/dev/null
-  chown "$OWNER":"$OWNER" "$HOME_DIR/TriniVoice-players.zip"
-  echo "  Готов: $HOME_DIR/TriniVoice-players.zip (адрес $IP:$PORT уже вписан)"
+  # запоминаем адрес: он нужен командам «sudo trinivoice add-bridge / players-zip»
+  node -e 'const fs=require("fs"),f="/etc/trinivoice/config.json",c=JSON.parse(fs.readFileSync(f));c.publicIp=process.argv[1];fs.writeFileSync(f,JSON.stringify(c,null,2)+"\n")' "$IP"
+  /usr/local/bin/trinivoice players-zip | sed 's/^/  /'
 else
   echo "  Не удалось узнать публичный IP. Соберите архив сами:"
   echo "  bash deploy/make-player-zip.sh ВАШ_IP $PORT ~/TriniVoice-players.zip"
@@ -107,4 +120,5 @@ echo " Настройки: sudo nano /etc/trinivoice/config.json"
 echo "            потом sudo systemctl restart trinivoice"
 echo " Журнал:    sudo journalctl -u trinivoice -f"
 echo " Статистика: sudo trinivoice-stats   (в игре: /tv admin stats)"
+echo " Мост для игроков из других стран: sudo trinivoice add-bridge ru"
 echo "================================================================"
